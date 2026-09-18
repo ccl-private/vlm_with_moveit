@@ -133,8 +133,8 @@ class VncOverlayViewer:
             self.mujoco.mjtFont.mjFONT_NORMAL,
             self.mujoco.mjtGridPos.mjGRID_TOPLEFT,
             viewport,
-            "腕部 RGB-D 相机",
-            f"当前：{state}；D 在主窗口切换深度，Esc 关闭全部窗口",
+            "Wrist RGB-D Camera",
+            f"Mode: {state} | D: depth mode in main window | Esc: close",
             self.wrist_context,
         )
         self.glfw.swap_buffers(self.wrist_window)
@@ -173,8 +173,8 @@ class VncOverlayViewer:
                 self.mujoco.mjtFont.mjFONT_NORMAL,
                 self.mujoco.mjtGridPos.mjGRID_TOPLEFT,
                 viewport,
-                "阶段 1：统一 Panda 抓取场景",
-                f"右上：固定相机；独立窗口：腕部相机；当前：{state}\nD：切换深度，R：重置，Esc：关闭",
+                "Stage 1: Unified Panda Pick-and-Place",
+                f"Top-right: Fixed RGB-D | Wrist: separate window | Mode: {state}\nD: depth  R: reset  Esc: close",
                 self.context,
             )
             self.glfw.swap_buffers(self.window)
