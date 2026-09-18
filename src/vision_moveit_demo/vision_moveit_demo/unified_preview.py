@@ -62,7 +62,7 @@ def _save_stage1_snapshot(path: Path, simulation: UnifiedPandaCupSimulation) -> 
 class VncOverlayViewer:
     """不依赖父项目的最小 GLFW/MuJoCo viewer，含两个实时相机叠加图。"""
 
-    def __init__(self, simulation: UnifiedPandaCupSimulation) -> None:
+    def __init__(self, simulation: UnifiedPandaCupSimulation, title: str = "MoveIt 阶段 1") -> None:
         import glfw
         import mujoco
 
@@ -75,7 +75,8 @@ class VncOverlayViewer:
         if not glfw.init():
             raise RuntimeError("无法初始化 GLFW；请从 VNC 桌面终端运行，并确认 DISPLAY 已设置。")
         self.glfw, self.mujoco, self.simulation = glfw, mujoco, simulation
-        self.window = glfw.create_window(1440, 960, "MoveIt 阶段 1：Panda、固定相机与腕部相机", None, None)
+        self.title = title
+        self.window = glfw.create_window(1440, 960, f"{title}：Panda、固定相机与腕部相机", None, None)
         if self.window is None:
             glfw.terminate()
             raise RuntimeError("无法创建 MuJoCo VNC 窗口。")
@@ -83,7 +84,7 @@ class VncOverlayViewer:
         glfw.swap_interval(1)
         glfw.show_window(self.window)
         glfw.focus_window(self.window)
-        self.wrist_window = glfw.create_window(640, 480, "MoveIt 阶段 1：腕部 RGB-D 相机", None, None)
+        self.wrist_window = glfw.create_window(640, 480, f"{title}：腕部 RGB-D 相机", None, None)
         if self.wrist_window is None:
             glfw.destroy_window(self.window)
             glfw.terminate()
@@ -139,47 +140,46 @@ class VncOverlayViewer:
         )
         self.glfw.swap_buffers(self.wrist_window)
 
+    def render_once(self, task_state: str = "Idle") -> bool:
+        """绘制一次当前仿真状态；供阶段 2 执行器复用，不推进物理时钟。"""
+        if self.glfw.window_should_close(self.window) or self.glfw.window_should_close(self.wrist_window):
+            return False
+        frames = self.simulation.cameras()
+        # ``mujoco.Renderer`` 会为离屏 RGB-D 临时切换 GL 上下文；在绘制
+        # VNC 主画面和叠加图前必须切回可见 GLFW 窗口，否则会得到黑屏。
+        self.glfw.make_context_current(self.window)
+        fixed = _depth_rgb(frames["fixed"].depth) if self.show_depth else frames["fixed"].rgb
+        wrist = _depth_rgb(frames["wrist"].depth) if self.show_depth else frames["wrist"].rgb
+        width, height = self.glfw.get_framebuffer_size(self.window)
+        viewport = self.mujoco.MjrRect(0, 0, width, height)
+        self.mujoco.mjv_updateScene(
+            self.simulation.model, self.simulation.data, self.option, None, self.camera,
+            self.mujoco.mjtCatBit.mjCAT_ALL.value, self.scene,
+        )
+        self.mujoco.mjr_render(viewport, self.scene, self.context)
+        overlay_width = max(220, width // 4)
+        overlay_height = max(165, int(overlay_width * 0.75))
+        camera_mode = "Depth" if self.show_depth else "RGB"
+        self._draw_camera(
+            fixed, width - overlay_width - 16, height - overlay_height - 16, overlay_width, overlay_height, self.context
+        )
+        self.mujoco.mjr_overlay(
+            self.mujoco.mjtFont.mjFONT_NORMAL,
+            self.mujoco.mjtGridPos.mjGRID_TOPLEFT,
+            viewport,
+            "Panda Pick-and-Place",
+            f"State: {task_state} | Fixed camera: top-right | Wrist: separate window\n"
+            f"Camera: {camera_mode} | D: depth  R: reset  Esc: stop",
+            self.context,
+        )
+        self.glfw.swap_buffers(self.window)
+        self._render_wrist_window(wrist, task_state)
+        self.glfw.poll_events()
+        return True
+
     def run(self) -> None:
-        while not self.glfw.window_should_close(self.window):
-            if self.glfw.window_should_close(self.wrist_window):
-                self.glfw.set_window_should_close(self.window, True)
-                continue
+        while self.render_once("Idle / home"):
             self.simulation.hold_home(steps=1)
-            frames = self.simulation.cameras()
-            # ``mujoco.Renderer`` 会为离屏 RGB-D 临时切换 GL 上下文；在绘制
-            # VNC 主画面和叠加图前必须切回可见 GLFW 窗口，否则会得到黑屏。
-            self.glfw.make_context_current(self.window)
-            fixed = _depth_rgb(frames["fixed"].depth) if self.show_depth else frames["fixed"].rgb
-            wrist = _depth_rgb(frames["wrist"].depth) if self.show_depth else frames["wrist"].rgb
-            width, height = self.glfw.get_framebuffer_size(self.window)
-            viewport = self.mujoco.MjrRect(0, 0, width, height)
-            self.mujoco.mjv_updateScene(
-                self.simulation.model,
-                self.simulation.data,
-                self.option,
-                None,
-                self.camera,
-                self.mujoco.mjtCatBit.mjCAT_ALL.value,
-                self.scene,
-            )
-            self.mujoco.mjr_render(viewport, self.scene, self.context)
-            overlay_width = max(220, width // 4)
-            overlay_height = max(165, int(overlay_width * 0.75))
-            state = "深度伪彩" if self.show_depth else "RGB"
-            self._draw_camera(
-                fixed, width - overlay_width - 16, height - overlay_height - 16, overlay_width, overlay_height, self.context
-            )
-            self.mujoco.mjr_overlay(
-                self.mujoco.mjtFont.mjFONT_NORMAL,
-                self.mujoco.mjtGridPos.mjGRID_TOPLEFT,
-                viewport,
-                "Stage 1: Unified Panda Pick-and-Place",
-                f"Top-right: Fixed RGB-D | Wrist: separate window | Mode: {state}\nD: depth  R: reset  Esc: close",
-                self.context,
-            )
-            self.glfw.swap_buffers(self.window)
-            self._render_wrist_window(wrist, state)
-            self.glfw.poll_events()
             time.sleep(1.0 / 30.0)
         self.context.free()
         self.wrist_context.free()

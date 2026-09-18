@@ -58,7 +58,7 @@ def generate_launch_description():
             )],
         ),
         Node(package="vision_moveit_bridge", executable="moveit_target_bridge", output="screen",
-             parameters=[moveit_config.to_dict(), {"execute_in_simulation": True}]),
+             parameters=[moveit_config.to_dict(), {"execute_in_simulation": False}]),
         Node(
             package="rviz2",
             executable="rviz2",
