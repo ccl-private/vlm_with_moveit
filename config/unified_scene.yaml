@@ -1,0 +1,16 @@
+# 阶段 1 统一场景约定。运行时随机化只能覆盖此文件声明的对象和范围。
+scene_xml: assets/panda_mjcf/unified_panda_cup_scene.xml
+robot:
+  base_frame: panda_link0
+  end_effector_frame: panda_hand
+  arm_joints: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
+  gripper_joints: [finger_joint1, finger_joint2]
+cameras:
+  fixed: {name: camera_fixed, width: 640, height: 480}
+  wrist: {name: camera_wrist, width: 640, height: 480}
+  global: {name: camera_global, width: 960, height: 720}
+objects:
+  red_cup: {body: red_cup, geom: red_cup_geom}
+  green_cup: {body: green_cup, geom: green_cup_geom}
+  blue_cup: {body: blue_cup, geom: blue_cup_geom}
+  tray: {body: tray, drop_site: tray_drop_zone}

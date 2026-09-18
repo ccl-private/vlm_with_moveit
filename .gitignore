@@ -1,0 +1,16 @@
+/build/
+/install/
+/log/
+/logs/*
+!/logs/.gitkeep
+/.env/
+/.env_jazzy/
+/.native_env/
+/.mamba/
+/.mamba_native/
+/.mamba_local/
+/.mamba_ros/
+/.tools/
+__pycache__/
+*.py[cod]
+.pytest_cache/
