@@ -83,6 +83,17 @@ class VncOverlayViewer:
         glfw.swap_interval(1)
         glfw.show_window(self.window)
         glfw.focus_window(self.window)
+        self.wrist_window = glfw.create_window(640, 480, "MoveIt 阶段 1：腕部 RGB-D 相机", None, None)
+        if self.wrist_window is None:
+            glfw.destroy_window(self.window)
+            glfw.terminate()
+            raise RuntimeError("无法创建腕部相机窗口。")
+        glfw.make_context_current(self.wrist_window)
+        glfw.swap_interval(1)
+        glfw.set_window_pos(self.wrist_window, 24, 80)
+        glfw.show_window(self.wrist_window)
+        self.wrist_context = mujoco.MjrContext(simulation.model, mujoco.mjtFontScale.mjFONTSCALE_150)
+        glfw.make_context_current(self.window)
         self.camera = mujoco.MjvCamera()
         self.camera.type = mujoco.mjtCamera.mjCAMERA_FIXED
         self.camera.fixedcamid = mujoco.mj_name2id(
@@ -105,13 +116,34 @@ class VncOverlayViewer:
         elif key == self.glfw.KEY_ESCAPE:
             self.glfw.set_window_should_close(self.window, True)
 
-    def _draw_camera(self, image: np.ndarray, left: int, bottom: int, width: int, height: int) -> None:
-        resized = _resize_nearest(image, height, width)
+    def _draw_camera(self, image: np.ndarray, left: int, bottom: int, width: int, height: int, context) -> None:
+        """将连续 RGB 图像上传到指定 viewport。"""
+        resized = np.ascontiguousarray(np.flipud(_resize_nearest(image, height, width)))
         viewport = self.mujoco.MjrRect(left, bottom, width, height)
-        self.mujoco.mjr_drawPixels(np.flipud(resized).ravel(), None, viewport, self.context)
+        self.mujoco.mjr_drawPixels(resized.ravel(), None, viewport, context)
+
+    def _render_wrist_window(self, image: np.ndarray, state: str) -> None:
+        """独立腕部窗口规避 Xvnc/VirtualGL 的同窗多 viewport 传输缺陷。"""
+        self.glfw.make_context_current(self.wrist_window)
+        width, height = self.glfw.get_framebuffer_size(self.wrist_window)
+        viewport = self.mujoco.MjrRect(0, 0, width, height)
+        self.mujoco.mjr_rectangle(viewport, 0.0, 0.0, 0.0, 1.0)
+        self._draw_camera(image, 0, 0, width, height, self.wrist_context)
+        self.mujoco.mjr_overlay(
+            self.mujoco.mjtFont.mjFONT_NORMAL,
+            self.mujoco.mjtGridPos.mjGRID_TOPLEFT,
+            viewport,
+            "腕部 RGB-D 相机",
+            f"当前：{state}；D 在主窗口切换深度，Esc 关闭全部窗口",
+            self.wrist_context,
+        )
+        self.glfw.swap_buffers(self.wrist_window)
 
     def run(self) -> None:
         while not self.glfw.window_should_close(self.window):
+            if self.glfw.window_should_close(self.wrist_window):
+                self.glfw.set_window_should_close(self.window, True)
+                continue
             self.simulation.hold_home(steps=1)
             frames = self.simulation.cameras()
             # ``mujoco.Renderer`` 会为离屏 RGB-D 临时切换 GL 上下文；在绘制
@@ -133,21 +165,25 @@ class VncOverlayViewer:
             self.mujoco.mjr_render(viewport, self.scene, self.context)
             overlay_width = max(220, width // 4)
             overlay_height = max(165, int(overlay_width * 0.75))
-            self._draw_camera(fixed, width - overlay_width - 16, height - overlay_height - 16, overlay_width, overlay_height)
-            self._draw_camera(wrist, width - overlay_width - 16, 16, overlay_width, overlay_height)
             state = "深度伪彩" if self.show_depth else "RGB"
+            self._draw_camera(
+                fixed, width - overlay_width - 16, height - overlay_height - 16, overlay_width, overlay_height, self.context
+            )
             self.mujoco.mjr_overlay(
                 self.mujoco.mjtFont.mjFONT_NORMAL,
                 self.mujoco.mjtGridPos.mjGRID_TOPLEFT,
                 viewport,
                 "阶段 1：统一 Panda 抓取场景",
-                f"右上：固定相机；右下：腕部相机；当前：{state}\nD：切换深度，R：重置，Esc：关闭",
+                f"右上：固定相机；独立窗口：腕部相机；当前：{state}\nD：切换深度，R：重置，Esc：关闭",
                 self.context,
             )
             self.glfw.swap_buffers(self.window)
+            self._render_wrist_window(wrist, state)
             self.glfw.poll_events()
             time.sleep(1.0 / 30.0)
         self.context.free()
+        self.wrist_context.free()
+        self.glfw.destroy_window(self.wrist_window)
         self.glfw.destroy_window(self.window)
         self.glfw.terminate()
 
