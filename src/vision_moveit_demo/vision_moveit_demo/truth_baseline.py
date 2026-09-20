@@ -36,6 +36,12 @@ class MoveItTrajectoryClient(Node):
         self.joint_publisher.publish(message)
 
     def publish_scene(self, snapshot, grasp_target: str | None = None) -> None:
+        positions = {name: value["position_base_m"] for name, value in snapshot.planning_scene_objects.items()}
+        positions["table"] = np.array([0.725, 0.0, 0.36])
+        self.publish_scene_positions(positions, grasp_target=grasp_target)
+
+    def publish_scene_positions(self, positions: dict[str, np.ndarray], grasp_target: str | None = None) -> None:
+        """发布显式场景坐标；视觉闭环调用方不得传入 MuJoCo 真值快照。"""
         scene = PlanningScene(is_diff=True)
         dimensions = {
             # Panda 基座安装在桌面边缘。MoveIt 场景仅放入基座前方的作业台面，
@@ -46,8 +52,6 @@ class MoveItTrajectoryClient(Node):
             "green_cup": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
             "blue_cup": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
         }
-        positions = {name: value["position_base_m"] for name, value in snapshot.planning_scene_objects.items()}
-        positions["table"] = np.array([0.725, 0.0, 0.36])
         for name, (shape_type, shape_dimensions) in dimensions.items():
             # 接近阶段允许末端与目标杯建立接触；其它杯子、桌面和托盘仍进入碰撞场景。
             if name == grasp_target:
