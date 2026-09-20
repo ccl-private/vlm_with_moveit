@@ -45,6 +45,31 @@ class TrajectoryExecutionSummary:
         }
 
 
+@dataclass(frozen=True)
+class PhysicalReleaseSummary:
+    """真实松爪后的物理状态证据；放置过程绝不重写物体自由关节状态。"""
+
+    object_id: str
+    release_position_base_m: np.ndarray
+    release_quaternion_wxyz: np.ndarray
+    position_after_settle_base_m: np.ndarray
+    linear_velocity_after_settle_mps: np.ndarray
+    settle_duration_s: float
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "object_id": self.object_id,
+            "release_position_base_m": self.release_position_base_m.tolist(),
+            "release_quaternion_wxyz": self.release_quaternion_wxyz.tolist(),
+            "position_after_settle_base_m": self.position_after_settle_base_m.tolist(),
+            "linear_velocity_after_settle_mps": self.linear_velocity_after_settle_mps.tolist(),
+            "settle_duration_s": self.settle_duration_s,
+            "qpos_reset_at_release": False,
+            "qvel_reset_at_release": False,
+            "placement_method": "physical_detach_and_mujoco_settle",
+        }
+
+
 class MujocoTaskExecutor:
     """阶段 2 的唯一 MuJoCo 执行入口；夹取附着与事件在此原子处理。"""
 
@@ -73,6 +98,7 @@ class MujocoTaskExecutor:
         self._step_count = 0
         self.rendered_frame_count = 0
         self.trajectory_summaries: list[TrajectoryExecutionSummary] = []
+        self.physical_release_summaries: list[PhysicalReleaseSummary] = []
 
     def _event(self, name: str, **details: str | float) -> None:
         self.events.append(SimulationEvent(name, float(self.simulation.data.time), details))
@@ -171,7 +197,7 @@ class MujocoTaskExecutor:
         waypoint_positions: list[dict[str, float]],
         *,
         profile: str = "normal",
-        speed_scale: float = 1.35,
+        speed_scale: float = 1.70,
     ) -> TrajectoryExecutionSummary:
         """连续执行 MoveIt 的整条时间参数化关节轨迹。
 
@@ -188,7 +214,7 @@ class MujocoTaskExecutor:
             raise ValueError("MoveIt 时间路点必须单调递增")
 
         # 这是仿真正常档的硬速度上限（rad/s），而非真机参数。它只作为对 MoveIt
-        # 时间参数化的二次保护；当前 1.35 倍加速后的轨迹远低于这些限制。
+        # 时间参数化的二次保护；当前 1.70 倍加速后的轨迹仍低于这些限制。
         normal_max_speed_rad_s = {
             "joint1": 2.0,
             "joint2": 2.0,
@@ -279,25 +305,37 @@ class MujocoTaskExecutor:
         self._hold_attached_object()
         self._event("grasp_attached", object_id=object_name, method="kinematic_hold")
 
-    def release_to_tray(self, tray_center_base: np.ndarray) -> None:
-        """解除约束并在托盘内部放置杯子，供物理稳定与放置事件复核。"""
+    def release_physical(self, settle_s: float = 0.75) -> PhysicalReleaseSummary:
+        """在当前夹爪位置解除附着，再完全交由 MuJoCo 接触动力学放置。"""
         if self.attached_object is None:
             raise RuntimeError("没有附着对象可释放")
+        if settle_s <= 0.0:
+            raise ValueError("物理稳定时间必须为正数")
         model, data = self.simulation.model, self.simulation.data
         object_name = self.attached_object
         joint_id = model.joint(f"{object_name}_freejoint").id
         qpos_address = model.jnt_qposadr[joint_id]
-        # 托盘底部顶面为 z=0.462，圆柱杯半高为 0.07。
-        data.qpos[qpos_address : qpos_address + 3] = np.asarray(tray_center_base) + np.array([0.0, 0.0, 0.082])
-        data.qpos[qpos_address + 3 : qpos_address + 7] = (1.0, 0.0, 0.0, 0.0)
-        data.qvel[model.jnt_dofadr[joint_id] : model.jnt_dofadr[joint_id] + 6] = 0.0
-        mujoco.mj_forward(model, data)
-        self._event("grasp_released", object_id=object_name)
+        dof_address = model.jnt_dofadr[joint_id]
+        release_position = data.qpos[qpos_address : qpos_address + 3].copy()
+        release_quaternion = data.qpos[qpos_address + 3 : qpos_address + 7].copy()
+        # 这里故意不写 qpos/qvel：物体保持夹爪带至的当前自由关节状态并自然下落。
+        self._event("grasp_released_physical", object_id=object_name, qpos_reset=0.0, qvel_reset=0.0)
         self.attached_object = None
         self._grasp_relative_position = None
         self._grasp_relative_rotation = None
-        for _ in range(max(1, int(np.ceil(0.35 / model.opt.timestep)))):
+        for _ in range(max(1, int(np.ceil(settle_s / model.opt.timestep)))):
             self._advance_one_step()
+        summary = PhysicalReleaseSummary(
+            object_id=object_name,
+            release_position_base_m=release_position,
+            release_quaternion_wxyz=release_quaternion,
+            position_after_settle_base_m=data.qpos[qpos_address : qpos_address + 3].copy(),
+            linear_velocity_after_settle_mps=data.qvel[dof_address : dof_address + 3].copy(),
+            settle_duration_s=settle_s,
+        )
+        self.physical_release_summaries.append(summary)
+        self._event("physical_settle_complete", object_id=object_name, duration_s=settle_s)
+        return summary
 
     def object_in_tray(self, object_name: str, tray_center_base: np.ndarray) -> bool:
         position = self.simulation.evaluation_only_truth(object_name)

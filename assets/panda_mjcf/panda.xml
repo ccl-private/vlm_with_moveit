@@ -214,8 +214,9 @@
                     <geom mesh="link7_c" class="collision"/>
                     <body name="hand" pos="0 0 0.107" quat="0.9238795 0 0 -0.3826834">
                       <inertial mass="0.73" pos="-0.01 0 0.03" diaginertia="0.001 0.0025 0.0017"/>
-                      <!-- 抬高至夹爪上方，向下观察操作区域；用于模拟腕部 RGB-D。 -->
-                      <camera name="camera_wrist" pos="0.15 -0.05 -0.28" euler="0 3.14159 0" fovy="65"/>
+                      <!-- 夹爪侧上方的眼在手（RGB-D）：相对掌心横向外偏并提高，
+                           光轴朝下覆盖两指前方的抓取区，避免上游机械臂遮住主视野。 -->
+                      <camera name="camera_wrist" pos="-0.18 -0.06 -0.32" euler="0 2.90 0" fovy="65"/>
                       <geom mesh="hand_0" material="off_white" class="visual"/>
                       <geom mesh="hand_1" material="black" class="visual"/>
                       <geom mesh="hand_2" material="black" class="visual"/>

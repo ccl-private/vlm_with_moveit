@@ -176,6 +176,27 @@ class CadPoseEstimate:
         }
 
 
+@dataclass(frozen=True)
+class PhysicalPlacementTargets:
+    """由对象目录推导的真实物理放置目标，均处于 ``panda_link0``。"""
+
+    tray_center_base_m: np.ndarray
+    object_release_center_base_m: np.ndarray
+    gripper_release_base_m: np.ndarray
+    gripper_above_base_m: np.ndarray
+    free_fall_clearance_m: float
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "tray_center_base_m": self.tray_center_base_m.tolist(),
+            "object_release_center_base_m": self.object_release_center_base_m.tolist(),
+            "gripper_release_base_m": self.gripper_release_base_m.tolist(),
+            "gripper_above_base_m": self.gripper_above_base_m.tolist(),
+            "free_fall_clearance_m": self.free_fall_clearance_m,
+            "source": "object_catalog_and_grasp_template",
+        }
+
+
 class ObjectCatalog:
     def __init__(self, root: Path) -> None:
         catalog_path = root / "assets" / "object_models" / "catalog.json"
@@ -241,6 +262,25 @@ class ObjectCatalog:
 
     def tray_center_base_m(self) -> np.ndarray:
         return np.asarray(self._fixture["tray"]["position_base_m"], dtype=np.float64)
+
+    def physical_placement_targets(self, model: CadModel, template: GraspTemplate) -> PhysicalPlacementTargets:
+        """从静态托盘几何和 CAD/抓取模板推导释放位，不读取仿真真值。"""
+        tray = self._fixture["tray"]
+        center = np.asarray(tray["position_base_m"], dtype=np.float64)
+        floor_z_offset = float(tray["floor_z_offset_m"])
+        drop_clearance = float(tray["drop_clearance_m"])
+        approach_clearance = float(tray["place_approach_clearance_m"])
+        object_center = center + np.array([0.0, 0.0, floor_z_offset + model.height_m / 2.0 + drop_clearance])
+        # 本阶段已限定对象竖直、抓取模板为顶部垂直接近；因此对象坐标的模板平移与基座轴对齐。
+        gripper_release = object_center + template.position_object_m
+        gripper_above = gripper_release + np.array([0.0, 0.0, approach_clearance])
+        return PhysicalPlacementTargets(
+            tray_center_base_m=center,
+            object_release_center_base_m=object_center,
+            gripper_release_base_m=gripper_release,
+            gripper_above_base_m=gripper_above,
+            free_fall_clearance_m=drop_clearance,
+        )
 
 
 def _points_from_mask(frame: UnifiedCameraFrame, mask: np.ndarray) -> np.ndarray:

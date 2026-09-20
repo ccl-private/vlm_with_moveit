@@ -68,14 +68,14 @@ def main() -> None:
         # 而不是静默忽略其 CAD 抓取姿态。
         if not np.allclose(grasp_orientation, np.array([1.0, 0.0, 0.0, 0.0]), atol=1e-6):
             raise RuntimeError("当前 MoveIt 桥接仅支持向下顶抓模板方向")
-        tray_center = catalog.tray_center_base_m()
+        placement = catalog.physical_placement_targets(model, template)
+        tray_center = placement.tray_center_base_m
         targets = [
             ("pregrasp", grasp_position + np.array([0.0, 0.0, template.approach_clearance_m])),
             ("approach", grasp_position),
             ("lift", grasp_position + np.array([0.0, 0.0, template.lift_clearance_m])),
-            # 托盘位于 Panda 有效工作空间边缘；该安全预位由静态工装配置推导，
-            # 不是 MuJoCo 托盘真值读取。
-            ("place", tray_center + np.array([-0.20, 0.02, 0.30])),
+            ("place_above", placement.gripper_above_base_m),
+            ("place_descend", placement.gripper_release_base_m),
         ]
         # 正常档以仿真时间一倍速运行；VNC 只显示该节拍，不通过渲染 sleep 改变它。
         executor = MujocoTaskExecutor(simulation, frame_callback=render_frame, realtime_factor=1.0)
@@ -87,6 +87,7 @@ def main() -> None:
             time.sleep(3.0)
             client.publish_scene_positions(catalog.fixture_collision_positions(), grasp_target="red_cup")
             time.sleep(1.0)
+            motion_wall_start = time.monotonic()
             executor.set_gripper(opened=True)
             for stage, target in targets[:2]:
                 executor.set_display_state(f"CAD grasp / MoveIt: {stage}")
@@ -101,11 +102,12 @@ def main() -> None:
                 client.publish_joint_state(executor.joint_positions())
                 _execute_trajectory(executor, client.request(target))
                 executor._event(f"moveit_{stage}_complete")
-            executor.set_display_state("Gripper: release CAD target into tray")
+            executor.set_display_state("Gripper: physical release above tray")
             executor.set_gripper(opened=True)
-            executor.release_to_tray(tray_center)
+            physical_release = executor.release_physical()
             # 仅评测：不会将这个真值结果反馈给任何下一步控制决策。
             evaluation_only_success = executor.object_in_tray("red_cup", tray_center)
+            motion_wall_duration_s = time.monotonic() - motion_wall_start
             output = arguments.root / "logs" / "episodes" / "cad_matching_latest"
             output.mkdir(parents=True, exist_ok=True)
             _write_pgm(output / "target_mask.pgm", segmentation.mask)
@@ -123,12 +125,15 @@ def main() -> None:
                 "pose_estimate": pose.as_dict(),
                 "grasp_position_base_m": grasp_position.tolist(),
                 "fixture_tray_center_base_m": tray_center.tolist(),
+                "physical_placement": placement.as_dict(),
+                "physical_release": physical_release.as_dict(),
                 "execution": {
                     "profile": "normal",
                     "realtime_factor": executor.realtime_factor,
                     "trajectory_summaries": [summary.as_dict() for summary in executor.trajectory_summaries],
                     "rendered_frame_count": executor.rendered_frame_count,
                     "pure_motion_duration_s": float(executor.events[-1].timestamp - executor.events[0].timestamp),
+                    "wall_motion_duration_s": motion_wall_duration_s,
                 },
                 "events": [
                     {"name": event.name, "timestamp_s": event.timestamp, "details": event.details}
@@ -148,6 +153,8 @@ def main() -> None:
             client.destroy_node()
             rclpy.shutdown()
     finally:
+        if viewer is not None:
+            viewer.close()
         simulation.close()
 
 

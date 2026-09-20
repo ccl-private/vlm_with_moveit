@@ -141,13 +141,15 @@ def main() -> None:
             time.sleep(1.0)
         cup = simulation.evaluation_only_truth("red_cup")
         tray = simulation.evaluation_only_truth("tray")
+        # 阶段 2 允许读取托盘真值作单元测试，但实际放置仍必须在当前位置物理松爪，
+        # 不能把物体自由关节改写到托盘中。
+        release_hand = tray + np.array([0.0, 0.0, 0.194])
         targets = [
             ("pregrasp", np.array([0.45, 0.0, 0.55])),
             ("approach", cup + np.array([0.0, 0.0, 0.10])),
             ("lift", cup + np.array([0.0, 0.0, 0.30])),
-            # 托盘位于工作空间边缘；先到其内侧上方的安全放置预位，
-            # 再由夹取执行器沿竖直方向释放到托盘落点。
-            ("place", np.array([0.54, -0.18, 0.75])),
+            ("place_above", release_hand + np.array([0.0, 0.0, 0.12])),
+            ("place_descend", release_hand),
         ]
         executor.set_gripper(opened=True)
         for stage, target in targets[:2]:
@@ -163,9 +165,9 @@ def main() -> None:
             client.publish_joint_state(executor.joint_positions())
             _execute_trajectory(executor, client.request(target))
             executor._event(f"moveit_{stage}_complete")
-        executor.set_display_state("Gripper: release into tray")
+        executor.set_display_state("Gripper: physical release above tray")
         executor.set_gripper(opened=True)
-        executor.release_to_tray(tray)
+        executor.release_physical()
         success = executor.object_in_tray("red_cup", tray)
         payload = {
             "instruction": arguments.instruction,
@@ -186,6 +188,8 @@ def main() -> None:
     finally:
         client.destroy_node()
         rclpy.shutdown()
+        if viewer is not None:
+            viewer.close()
         simulation.close()
 
 

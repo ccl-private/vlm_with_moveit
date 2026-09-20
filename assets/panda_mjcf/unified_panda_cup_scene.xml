@@ -45,7 +45,8 @@
       <geom name="blue_cup_geom" type="cylinder" size="0.038 0.07" material="cup_blue" mass="0.12" friction="1.2 0.01 0.001"/>
     </body>
 
-    <body name="tray" pos="0.74 -0.20 0.45">
+    <!-- 托盘位于 Panda 下向抓取姿态的可达区；其精确位置同时登记在对象目录中。 -->
+    <body name="tray" pos="0.52 0.25 0.45">
       <geom name="tray_base" type="box" size="0.13 0.11 0.012" material="tray_material"/>
       <geom name="tray_front" type="box" pos="0 -0.10 0.035" size="0.13 0.012 0.035" material="tray_material"/>
       <geom name="tray_back" type="box" pos="0 0.10 0.035" size="0.13 0.012 0.035" material="tray_material"/>

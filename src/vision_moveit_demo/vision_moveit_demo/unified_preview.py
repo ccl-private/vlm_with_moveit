@@ -76,7 +76,9 @@ class VncOverlayViewer:
             raise RuntimeError("无法初始化 GLFW；请从 VNC 桌面终端运行，并确认 DISPLAY 已设置。")
         self.glfw, self.mujoco, self.simulation = glfw, mujoco, simulation
         self.title = title
-        self.window = glfw.create_window(1440, 960, f"{title}：Panda、固定相机与腕部相机", None, None)
+        # 服务器 VNC/VirtualGL 下以 1152×768 呈现全局视图；该分辨率足以观察
+        # 夹爪、杯子和固定相机叠加，同时避免 1440×960 的交换缓冲拖慢控制回合。
+        self.window = glfw.create_window(1152, 768, f"{title}：Panda、固定相机与腕部相机", None, None)
         if self.window is None:
             glfw.terminate()
             raise RuntimeError("无法创建 MuJoCo VNC 窗口。")
@@ -84,7 +86,7 @@ class VncOverlayViewer:
         glfw.swap_interval(1)
         glfw.show_window(self.window)
         glfw.focus_window(self.window)
-        self.wrist_window = glfw.create_window(640, 480, f"{title}：腕部 RGB-D 相机", None, None)
+        self.wrist_window = glfw.create_window(480, 360, f"{title}：腕部 RGB-D 相机", None, None)
         if self.wrist_window is None:
             glfw.destroy_window(self.window)
             glfw.terminate()
@@ -144,12 +146,13 @@ class VncOverlayViewer:
         """绘制一次当前仿真状态；供阶段 2 执行器复用，不推进物理时钟。"""
         if self.glfw.window_should_close(self.window) or self.glfw.window_should_close(self.wrist_window):
             return False
-        frames = self.simulation.cameras()
-        # ``mujoco.Renderer`` 会为离屏 RGB-D 临时切换 GL 上下文；在绘制
-        # VNC 主画面和叠加图前必须切回可见 GLFW 窗口，否则会得到黑屏。
+        # 复用感知链已创建的渲染器。VirtualGL 下若额外创建离屏 renderer，跨两个
+        # GLFW 窗口的纹理上下文会变成全黑；此处只取两路所需 RGB（D 键才取深度）。
         self.glfw.make_context_current(self.window)
+        frames = self.simulation.cameras(("fixed", "wrist"), include_depth=self.show_depth)
         fixed = _depth_rgb(frames["fixed"].depth) if self.show_depth else frames["fixed"].rgb
         wrist = _depth_rgb(frames["wrist"].depth) if self.show_depth else frames["wrist"].rgb
+        self.glfw.make_context_current(self.window)
         width, height = self.glfw.get_framebuffer_size(self.window)
         viewport = self.mujoco.MjrRect(0, 0, width, height)
         self.mujoco.mjv_updateScene(
@@ -177,15 +180,19 @@ class VncOverlayViewer:
         self.glfw.poll_events()
         return True
 
-    def run(self) -> None:
-        while self.render_once("Idle / home"):
-            self.simulation.hold_home(steps=1)
-            time.sleep(1.0 / 30.0)
+    def close(self) -> None:
+        """释放 VNC 专用上下文；允许任务脚本在窗口关闭后干净退出。"""
         self.context.free()
         self.wrist_context.free()
         self.glfw.destroy_window(self.wrist_window)
         self.glfw.destroy_window(self.window)
         self.glfw.terminate()
+
+    def run(self) -> None:
+        while self.render_once("Idle / home"):
+            self.simulation.hold_home(steps=1)
+            time.sleep(1.0 / 30.0)
+        self.close()
 
 
 def main() -> None:

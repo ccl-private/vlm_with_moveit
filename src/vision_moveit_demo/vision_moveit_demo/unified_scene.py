@@ -85,16 +85,24 @@ class UnifiedPandaCupSimulation:
         for _ in range(steps):
             mujoco.mj_step(self.model, self.data)
 
-    def render_camera(self, name: str) -> UnifiedCameraFrame:
+    def render_camera(self, name: str, include_depth: bool = True) -> UnifiedCameraFrame:
+        """渲染一帧相机画面。
+
+        VNC 预览只需 RGB，跳过深度渲染可避免一半离屏渲染开销；感知、标定与
+        离线验收则保持默认的 RGB-D 输出。
+        """
         if not self._renderers:
             raise RuntimeError("相机渲染器尚未初始化")
         renderer = self._renderers[name]
         camera_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, name)
         renderer.update_scene(self.data, camera=name)
         rgb = renderer.render().copy()
-        renderer.enable_depth_rendering()
-        depth = renderer.render().copy()
-        renderer.disable_depth_rendering()
+        if include_depth:
+            renderer.enable_depth_rendering()
+            depth = renderer.render().copy()
+            renderer.disable_depth_rendering()
+        else:
+            depth = np.empty((0, 0), dtype=np.float32)
         fovy = np.deg2rad(self.model.cam_fovy[camera_id])
         focal = (self.height / 2.0) / np.tan(fovy / 2.0)
         intrinsic = np.array(
@@ -117,12 +125,17 @@ class UnifiedPandaCupSimulation:
             timestamp=float(self.data.time),
         )
 
-    def cameras(self) -> dict[str, UnifiedCameraFrame]:
-        return {
-            "global": self.render_camera("camera_global"),
-            "fixed": self.render_camera("camera_fixed"),
-            "wrist": self.render_camera("camera_wrist"),
-        }
+    def cameras(
+        self,
+        names: tuple[str, ...] = ("global", "fixed", "wrist"),
+        include_depth: bool = True,
+    ) -> dict[str, UnifiedCameraFrame]:
+        """按需取得相机帧，名称为 ``global``、``fixed`` 或 ``wrist``。"""
+        valid_names = {"global", "fixed", "wrist"}
+        unknown = set(names) - valid_names
+        if unknown:
+            raise ValueError(f"未知相机名称：{sorted(unknown)}")
+        return {name: self.render_camera(f"camera_{name}", include_depth=include_depth) for name in names}
 
     def synchronization_snapshot(self) -> UnifiedSceneSnapshot:
         """生成阶段 2 使用的原子场景同步输入，全部位姿表达在 ``panda_link0``。"""
