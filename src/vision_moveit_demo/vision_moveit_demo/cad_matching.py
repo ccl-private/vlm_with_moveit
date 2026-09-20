@@ -108,7 +108,9 @@ class ColorThresholdSegmenter:
         selectors = {
             "red": (red > 120) & (green < 100) & (blue < 100),
             "green": (green > 100) & (green > red * 1.3) & (green > blue * 1.15),
-            "blue": (blue > 105) & (blue > red * 1.25) & (blue > green * 1.15),
+            # 深蓝灰地面也满足通道比例，故对蓝色增加绝对亮度门限；实际蓝杯的
+            # 主色通道约为 177，而地面约为 111，仍保留足够的圆柱可见表面。
+            "blue": (blue > 140) & (blue > red * 1.25) & (blue > green * 1.15),
         }
         component = self._largest_component(selectors[intent.target_color])
         rows, columns = np.nonzero(component)
@@ -136,6 +138,7 @@ class CadModel:
     model_id: str
     category: str
     color: str
+    scene_object_id: str
     mesh_path: Path
     vertices_object_m: np.ndarray
     radius_m: float
@@ -238,6 +241,7 @@ class ObjectCatalog:
             model_id=str(raw["model_id"]),
             category=str(raw["category"]),
             color=str(attributes["color"]),  # type: ignore[index]
+            scene_object_id=str(raw["scene_object_id"]),
             mesh_path=mesh_path,
             vertices_object_m=vertices,
             radius_m=float(np.median(radial)),

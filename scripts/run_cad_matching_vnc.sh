@@ -27,4 +27,7 @@ trap cleanup EXIT INT TERM
 
 sleep 10
 echo "[阶段 3] 正在进行 RGB-D → CAD 模型匹配，并打开 VNC 任务窗口…"
-ROS_DOMAIN_ID="$ros_domain_id" ./scripts/run_cad_matching.sh --vnc --instruction "抓取红色杯子并放到托盘"
+if [[ "$#" == "0" ]]; then
+  set -- --instruction "抓取红色杯子并放到托盘"
+fi
+ROS_DOMAIN_ID="$ros_domain_id" ./scripts/run_cad_matching.sh --vnc "$@"

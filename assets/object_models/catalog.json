@@ -1,9 +1,48 @@
 {
   "models": [
     {
-      "model_id": "red_cylindrical_cup_v1",
+      "model_id": "cylindrical_cup_v1",
       "category": "cup",
       "attributes": {"color": "red"},
+      "scene_object_id": "red_cup",
+      "mesh": "red_cylindrical_cup_v1.obj",
+      "units": "m",
+      "symmetry": {"type": "axial", "axis_object": [0.0, 0.0, 1.0]},
+      "grasp_templates": [
+        {
+          "template_id": "top_down_center_v1",
+          "position_object_m": [0.0, 0.0, 0.10],
+          "orientation_object_xyzw": [1.0, 0.0, 0.0, 0.0],
+          "approach_clearance_m": 0.12,
+          "lift_clearance_m": 0.20,
+          "required_gripper_width_m": 0.076
+        }
+      ]
+    },
+    {
+      "model_id": "cylindrical_cup_v1",
+      "category": "cup",
+      "attributes": {"color": "green"},
+      "scene_object_id": "green_cup",
+      "mesh": "red_cylindrical_cup_v1.obj",
+      "units": "m",
+      "symmetry": {"type": "axial", "axis_object": [0.0, 0.0, 1.0]},
+      "grasp_templates": [
+        {
+          "template_id": "top_down_center_v1",
+          "position_object_m": [0.0, 0.0, 0.10],
+          "orientation_object_xyzw": [1.0, 0.0, 0.0, 0.0],
+          "approach_clearance_m": 0.12,
+          "lift_clearance_m": 0.20,
+          "required_gripper_width_m": 0.076
+        }
+      ]
+    },
+    {
+      "model_id": "cylindrical_cup_v1",
+      "category": "cup",
+      "attributes": {"color": "blue"},
+      "scene_object_id": "blue_cup",
       "mesh": "red_cylindrical_cup_v1.obj",
       "units": "m",
       "symmetry": {"type": "axial", "axis_object": [0.0, 0.0, 1.0]},
@@ -29,7 +68,8 @@
       "place_approach_clearance_m": 0.106,
       "inner_drop_half_extents_m": [0.08, 0.075]
     },
-    "green_cup": {"position_base_m": [0.38, 0.12, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
-    "blue_cup": {"position_base_m": [0.67, 0.10, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038}
+    "red_cup": {"position_base_m": [0.48, -0.16, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
+    "green_cup": {"position_base_m": [0.34, 0.06, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
+    "blue_cup": {"position_base_m": [0.30, -0.24, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038}
   }
 }

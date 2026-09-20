@@ -52,6 +52,16 @@ class MoveItTrajectoryClient(Node):
             "green_cup": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
             "blue_cup": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
         }
+        # MoveIt 服务会跨回合常驻。若上回合的非目标杯在场景中、而本回合它成为
+        # 抓取目标，必须先删除其旧碰撞体；否则规划器会把将要抓取的杯子视作障碍物。
+        if grasp_target is not None:
+            if grasp_target not in dimensions:
+                raise ValueError(f"未知抓取目标：{grasp_target}")
+            remove_target = CollisionObject()
+            remove_target.id = f"stage2_{grasp_target}"
+            remove_target.header.frame_id = "panda_link0"
+            remove_target.operation = CollisionObject.REMOVE
+            scene.world.collision_objects.append(remove_target)
         for name, (shape_type, shape_dimensions) in dimensions.items():
             # 接近阶段允许末端与目标杯建立接触；其它杯子、桌面和托盘仍进入碰撞场景。
             if name == grasp_target:

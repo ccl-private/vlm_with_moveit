@@ -59,6 +59,7 @@ def main() -> None:
         intent = RuleVlmAdapter().infer(arguments.instruction)
         catalog = ObjectCatalog(arguments.root)
         model = catalog.find(intent)
+        target_object_id = model.scene_object_id
         fixed_frame = simulation.cameras()["fixed"]
         segmentation = ColorThresholdSegmenter().segment(fixed_frame.rgb, intent)
         pose = CylinderCadMatcher().match(model, segmentation, fixed_frame)
@@ -79,13 +80,13 @@ def main() -> None:
         ]
         # 正常档以仿真时间一倍速运行；VNC 只显示该节拍，不通过渲染 sleep 改变它。
         executor = MujocoTaskExecutor(simulation, frame_callback=render_frame, realtime_factor=1.0)
-        executor.set_display_state("CAD match complete: red_cylindrical_cup_v1")
+        executor.set_display_state(f"CAD match complete: {target_object_id} / {model.model_id}")
         rclpy.init()
         client = MoveItTrajectoryClient()
         try:
-            # 当前工装位置来自对象目录；目标红杯位置仅来自本次 CAD 配准。
+            # 当前工装位置来自对象目录；目标杯位置仅来自本次 CAD 配准。
             time.sleep(3.0)
-            client.publish_scene_positions(catalog.fixture_collision_positions(), grasp_target="red_cup")
+            client.publish_scene_positions(catalog.fixture_collision_positions(), grasp_target=target_object_id)
             time.sleep(1.0)
             motion_wall_start = time.monotonic()
             executor.set_gripper(opened=True)
@@ -96,9 +97,9 @@ def main() -> None:
                 executor._event(f"moveit_{stage}_complete")
             executor.set_display_state("Gripper: close and stable attach CAD target")
             executor.set_gripper(opened=False)
-            executor.attach("red_cup")
+            executor.attach(target_object_id)
             for stage, target in targets[2:]:
-                executor.set_display_state(f"CAD grasp / MoveIt: {stage} with red cup")
+                executor.set_display_state(f"CAD grasp / MoveIt: {stage} with {target_object_id}")
                 client.publish_joint_state(executor.joint_positions())
                 _execute_trajectory(executor, client.request(target))
                 executor._event(f"moveit_{stage}_complete")
@@ -106,7 +107,7 @@ def main() -> None:
             executor.set_gripper(opened=True)
             physical_release = executor.release_physical()
             # 仅评测：不会将这个真值结果反馈给任何下一步控制决策。
-            evaluation_only_success = executor.object_in_tray("red_cup", tray_center)
+            evaluation_only_success = executor.object_in_tray(target_object_id, tray_center)
             motion_wall_duration_s = time.monotonic() - motion_wall_start
             output = arguments.root / "logs" / "episodes" / "cad_matching_latest"
             output.mkdir(parents=True, exist_ok=True)
@@ -115,6 +116,7 @@ def main() -> None:
                 "instruction": arguments.instruction,
                 "stage": "cad_model_matching_pick_place_baseline",
                 "semantic_result": intent.as_dict(),
+                "target_object_id": target_object_id,
                 "segmentation": segmentation.as_dict(),
                 "cad_model": {
                     "model_id": model.model_id,
@@ -144,10 +146,10 @@ def main() -> None:
             (output / "episode.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             if not evaluation_only_success:
-                raise RuntimeError("评测发现红杯未落入托盘")
+                raise RuntimeError(f"评测发现 {target_object_id} 未落入托盘")
             if viewer is not None:
                 print("CAD 模型匹配回合成功。VNC 主窗口按 Esc 退出。", flush=True)
-                while viewer.render_once("Success: CAD matched red cup in tray"):
+                while viewer.render_once(f"Success: CAD matched {target_object_id} in tray"):
                     time.sleep(1.0 / 30.0)
         finally:
             client.destroy_node()

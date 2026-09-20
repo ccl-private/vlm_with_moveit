@@ -67,8 +67,8 @@ class UnifiedPandaCupSimulation:
         # 必须在这里显式复位，否则会继承为零位姿，导致杯子落到世界原点。
         cup_positions = {
             "red_cup_freejoint": (0.48, -0.16, 0.465),
-            "green_cup_freejoint": (0.38, 0.12, 0.465),
-            "blue_cup_freejoint": (0.67, 0.10, 0.465),
+            "green_cup_freejoint": (0.34, 0.06, 0.465),
+            "blue_cup_freejoint": (0.30, -0.24, 0.465),
         }
         for joint_name, position in cup_positions.items():
             joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
