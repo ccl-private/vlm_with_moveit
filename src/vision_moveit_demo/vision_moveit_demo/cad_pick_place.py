@@ -48,14 +48,7 @@ def main() -> None:
         viewer = VncOverlayViewer(simulation, title="MoveIt 阶段 3 CAD 模型匹配")
         simulation.initialize_renderers()
         viewer.glfw.make_context_current(viewer.window)
-        last_frame_time = 0.0
-
         def render_frame(state: str) -> bool:
-            nonlocal last_frame_time
-            remaining = 1.0 / 30.0 - (time.monotonic() - last_frame_time)
-            if remaining > 0.0:
-                time.sleep(remaining)
-            last_frame_time = time.monotonic()
             return viewer.render_once(state)
 
     else:
@@ -84,7 +77,8 @@ def main() -> None:
             # 不是 MuJoCo 托盘真值读取。
             ("place", tray_center + np.array([-0.20, 0.02, 0.30])),
         ]
-        executor = MujocoTaskExecutor(simulation, frame_callback=render_frame)
+        # 正常档以仿真时间一倍速运行；VNC 只显示该节拍，不通过渲染 sleep 改变它。
+        executor = MujocoTaskExecutor(simulation, frame_callback=render_frame, realtime_factor=1.0)
         executor.set_display_state("CAD match complete: red_cylindrical_cup_v1")
         rclpy.init()
         client = MoveItTrajectoryClient()
@@ -129,6 +123,13 @@ def main() -> None:
                 "pose_estimate": pose.as_dict(),
                 "grasp_position_base_m": grasp_position.tolist(),
                 "fixture_tray_center_base_m": tray_center.tolist(),
+                "execution": {
+                    "profile": "normal",
+                    "realtime_factor": executor.realtime_factor,
+                    "trajectory_summaries": [summary.as_dict() for summary in executor.trajectory_summaries],
+                    "rendered_frame_count": executor.rendered_frame_count,
+                    "pure_motion_duration_s": float(executor.events[-1].timestamp - executor.events[0].timestamp),
+                },
                 "events": [
                     {"name": event.name, "timestamp_s": event.timestamp, "details": event.details}
                     for event in executor.events

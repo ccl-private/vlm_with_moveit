@@ -89,28 +89,16 @@ class MoveItTrajectoryClient(Node):
 
 def _execute_trajectory(executor: MujocoTaskExecutor, trajectory: RobotTrajectory) -> None:
     names = trajectory.joint_trajectory.joint_names
+    waypoint_times_s: list[float] = []
+    waypoint_positions: list[dict[str, float]] = []
     for point in trajectory.joint_trajectory.points:
         target = executor.joint_positions()
         for name, value in zip(names, point.positions):
             if name.startswith("panda_joint"):
                 target[name.replace("panda_", "")] = float(value)
-        current = executor.joint_positions()
-        # MoveIt 的时间参数基于理想 ros2_control 执行器；MuJoCo 的后三级
-        # Panda 关节力矩更低，尤其 joint7 不能套用前三级的速度。按各轴保守
-        # 速度上限计算此点所需时间，避免 OMPL 选到另一冗余姿态时回放失稳。
-        max_speed_rad_s = {
-            "joint1": 1.2,
-            "joint2": 1.2,
-            "joint3": 1.2,
-            "joint4": 1.0,
-            "joint5": 0.65,
-            "joint6": 0.65,
-            "joint7": 0.35,
-        }
-        required_duration = max(
-            abs(target[name] - current[name]) / max_speed_rad_s[name] for name in executor.arm_joint_names
-        )
-        executor.execute_joint_target(target, max(0.35, 1.25 * required_duration))
+        waypoint_positions.append(target)
+        waypoint_times_s.append(float(point.time_from_start.sec) + float(point.time_from_start.nanosec) * 1e-9)
+    executor.execute_timed_joint_trajectory(waypoint_times_s, waypoint_positions)
 
 
 def main() -> None:
