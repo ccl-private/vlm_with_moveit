@@ -51,6 +51,7 @@ class MoveItTrajectoryClient(Node):
             "red_cup": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
             "green_cup": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
             "blue_cup": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
+            "purple_cube": (SolidPrimitive.BOX, [0.07, 0.07, 0.07]),
         }
         # MoveIt 服务会跨回合常驻。若上回合的非目标杯在场景中、而本回合它成为
         # 抓取目标，必须先删除其旧碰撞体；否则规划器会把将要抓取的杯子视作障碍物。

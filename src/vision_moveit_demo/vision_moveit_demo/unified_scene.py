@@ -65,12 +65,13 @@ class UnifiedPandaCupSimulation:
         mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
         # Panda 的官方 keyframe 只定义了机械臂关节；场景后来加入的 freejoint
         # 必须在这里显式复位，否则会继承为零位姿，导致杯子落到世界原点。
-        cup_positions = {
+        graspable_object_positions = {
             "red_cup_freejoint": (0.48, -0.16, 0.465),
             "green_cup_freejoint": (0.34, 0.06, 0.465),
             "blue_cup_freejoint": (0.30, -0.24, 0.465),
+            "purple_cube_freejoint": (0.35, -0.08, 0.43),
         }
-        for joint_name, position in cup_positions.items():
+        for joint_name, position in graspable_object_positions.items():
             joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
             qpos_address = self.model.jnt_qposadr[joint_id]
             dof_address = self.model.jnt_dofadr[joint_id]
@@ -159,7 +160,7 @@ class UnifiedPandaCupSimulation:
             for name in joint_names
         }
         objects: dict[str, dict[str, np.ndarray]] = {}
-        for object_name in ("red_cup", "green_cup", "blue_cup", "tray"):
+        for object_name in ("red_cup", "green_cup", "blue_cup", "purple_cube", "tray"):
             body_id = self.model.body(object_name).id
             world_from_object = np.eye(4)
             world_from_object[:3, :3] = self.data.xmat[body_id].reshape(3, 3)

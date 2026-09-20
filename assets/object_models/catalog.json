@@ -1,10 +1,8 @@
 {
-  "models": [
+  "geometry_models": [
     {
       "model_id": "cylindrical_cup_v1",
-      "category": "cup",
-      "attributes": {"color": "red"},
-      "scene_object_id": "red_cup",
+      "geometry_type": "cylinder",
       "mesh": "red_cylindrical_cup_v1.obj",
       "units": "m",
       "symmetry": {"type": "axial", "axis_object": [0.0, 0.0, 1.0]},
@@ -20,36 +18,15 @@
       ]
     },
     {
-      "model_id": "cylindrical_cup_v1",
-      "category": "cup",
-      "attributes": {"color": "green"},
-      "scene_object_id": "green_cup",
-      "mesh": "red_cylindrical_cup_v1.obj",
+      "model_id": "box_cube_v1",
+      "geometry_type": "box",
+      "mesh": "box_cube_v1.obj",
       "units": "m",
-      "symmetry": {"type": "axial", "axis_object": [0.0, 0.0, 1.0]},
+      "symmetry": {"type": "discrete_z_4", "axis_object": [0.0, 0.0, 1.0]},
       "grasp_templates": [
         {
           "template_id": "top_down_center_v1",
-          "position_object_m": [0.0, 0.0, 0.10],
-          "orientation_object_xyzw": [1.0, 0.0, 0.0, 0.0],
-          "approach_clearance_m": 0.12,
-          "lift_clearance_m": 0.20,
-          "required_gripper_width_m": 0.076
-        }
-      ]
-    },
-    {
-      "model_id": "cylindrical_cup_v1",
-      "category": "cup",
-      "attributes": {"color": "blue"},
-      "scene_object_id": "blue_cup",
-      "mesh": "red_cylindrical_cup_v1.obj",
-      "units": "m",
-      "symmetry": {"type": "axial", "axis_object": [0.0, 0.0, 1.0]},
-      "grasp_templates": [
-        {
-          "template_id": "top_down_center_v1",
-          "position_object_m": [0.0, 0.0, 0.10],
+          "position_object_m": [0.0, 0.0, 0.135],
           "orientation_object_xyzw": [1.0, 0.0, 0.0, 0.0],
           "approach_clearance_m": 0.12,
           "lift_clearance_m": 0.20,
@@ -57,6 +34,12 @@
         }
       ]
     }
+  ],
+  "instances": [
+    {"scene_object_id": "red_cup", "category": "cup", "attributes": {"color": "red"}, "geometry_model_id": "cylindrical_cup_v1"},
+    {"scene_object_id": "green_cup", "category": "cup", "attributes": {"color": "green"}, "geometry_model_id": "cylindrical_cup_v1"},
+    {"scene_object_id": "blue_cup", "category": "cup", "attributes": {"color": "blue"}, "geometry_model_id": "cylindrical_cup_v1"},
+    {"scene_object_id": "purple_cube", "category": "block", "attributes": {"color": "purple"}, "geometry_model_id": "box_cube_v1"}
   ],
   "static_fixture": {
     "table": {"position_base_m": [0.725, 0.0, 0.36], "box_dimensions_m": [0.85, 0.96, 0.07]},
@@ -70,6 +53,7 @@
     },
     "red_cup": {"position_base_m": [0.48, -0.16, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
     "green_cup": {"position_base_m": [0.34, 0.06, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
-    "blue_cup": {"position_base_m": [0.30, -0.24, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038}
+    "blue_cup": {"position_base_m": [0.30, -0.24, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
+    "purple_cube": {"position_base_m": [0.35, -0.08, 0.43], "box_dimensions_m": [0.07, 0.07, 0.07]}
   }
 }

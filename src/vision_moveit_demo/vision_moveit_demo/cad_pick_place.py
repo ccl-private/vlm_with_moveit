@@ -1,4 +1,4 @@
-"""阶段 3 首个闭环：圆柱 OBJ 模型匹配驱动的抓取放置。
+"""阶段 3 闭环：语义选模、CAD 匹配驱动的抓取放置。
 
 控制目标只来自规则语义、RGB 分割、深度点云和预载 CAD 模型。MuJoCo 真值仅在
 回合末尾做评测，不参与 CAD 配准、抓取目标生成或 MoveIt 场景坐标。
@@ -16,7 +16,7 @@ import rclpy
 
 from .cad_matching import (
     ColorThresholdSegmenter,
-    CylinderCadMatcher,
+    CadMatcherDispatcher,
     ObjectCatalog,
     RuleVlmAdapter,
     grasp_pose_from_template,
@@ -34,7 +34,7 @@ def _write_pgm(path: Path, mask: np.ndarray) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="阶段 3：圆柱 CAD 模型匹配抓取基线")
+    parser = argparse.ArgumentParser(description="阶段 3：语义选模 CAD 匹配抓取基线")
     parser.add_argument("--instruction", default="抓取红色杯子并放到托盘")
     parser.add_argument("--root", type=Path, default=Path(os.environ["MOVEIT_EXPERIMENT_ROOT"]))
     parser.add_argument("--vnc", action="store_true", help="在 VNC 中显示 CAD 匹配驱动的执行过程。")
@@ -62,7 +62,7 @@ def main() -> None:
         target_object_id = model.scene_object_id
         fixed_frame = simulation.cameras()["fixed"]
         segmentation = ColorThresholdSegmenter().segment(fixed_frame.rgb, intent)
-        pose = CylinderCadMatcher().match(model, segmentation, fixed_frame)
+        pose = CadMatcherDispatcher().match(model, segmentation, fixed_frame)
         template = model.grasp_templates[0]
         grasp_position, grasp_orientation = grasp_pose_from_template(pose, template)
         # 当前 Panda 顶抓模板使用向下夹爪；任何目录模板方向不一致时应明确拒绝，
@@ -120,6 +120,8 @@ def main() -> None:
                 "segmentation": segmentation.as_dict(),
                 "cad_model": {
                     "model_id": model.model_id,
+                    "geometry_type": model.geometry_type,
+                    "scene_object_id": model.scene_object_id,
                     "mesh": str(model.mesh_path.relative_to(arguments.root)),
                     "symmetry": model.symmetry_type,
                     "selected_grasp_template": template.template_id,

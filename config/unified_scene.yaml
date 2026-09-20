@@ -13,4 +13,5 @@ objects:
   red_cup: {body: red_cup, geom: red_cup_geom}
   green_cup: {body: green_cup, geom: green_cup_geom}
   blue_cup: {body: blue_cup, geom: blue_cup_geom}
+  purple_cube: {body: purple_cube, geom: purple_cube_geom}
   tray: {body: tray, drop_site: tray_drop_zone}

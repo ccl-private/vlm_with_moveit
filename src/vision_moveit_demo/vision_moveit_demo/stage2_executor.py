@@ -74,7 +74,7 @@ class MujocoTaskExecutor:
     """阶段 2 的唯一 MuJoCo 执行入口；夹取附着与事件在此原子处理。"""
 
     arm_joint_names = tuple(f"joint{index}" for index in range(1, 8))
-    cup_names = ("red_cup", "green_cup", "blue_cup")
+    graspable_object_names = ("red_cup", "green_cup", "blue_cup", "purple_cube")
 
     def __init__(
         self,
@@ -290,7 +290,7 @@ class MujocoTaskExecutor:
 
     def attach(self, object_name: str) -> None:
         """确认夹取后记录稳定的末端—物体相对位姿。"""
-        if object_name not in self.cup_names:
+        if object_name not in self.graspable_object_names:
             raise ValueError(f"不支持附着的对象：{object_name}")
         if self.attached_object is not None:
             raise RuntimeError(f"已有附着对象：{self.attached_object}")

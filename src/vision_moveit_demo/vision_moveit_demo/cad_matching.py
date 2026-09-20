@@ -19,6 +19,7 @@ class TaskIntent:
     task: str
     target_category: str
     target_color: str
+    target_model_id: str
     destination_category: str
     confidence: float
     source: str
@@ -27,6 +28,7 @@ class TaskIntent:
         return {
             "task": self.task,
             "target_query": {"category": self.target_category, "attributes": {"color": self.target_color}},
+            "target_model_id": self.target_model_id,
             "destination_query": {"category": self.destination_category},
             "confidence": self.confidence,
             "source": self.source,
@@ -34,18 +36,31 @@ class TaskIntent:
 
 
 class RuleVlmAdapter:
-    """与未来真实 VLM 共用任务 JSON 的临时规则实现。"""
+    """与未来真实 VLM 共用任务 JSON 的临时规则实现。
 
-    supported_colors = {"红色": "red", "绿色": "green", "蓝色": "blue"}
+    规则实现只模拟 VLM 的语义选模输出；真实 VLM 的 ``target_model_id`` 仍须由
+    ``ObjectCatalog`` 与类别、颜色共同校验，不能直接当作控制目标。
+    """
+
+    supported_targets = {
+        "红色": ("red", "cup", "cylindrical_cup_v1", ("杯",)),
+        "绿色": ("green", "cup", "cylindrical_cup_v1", ("杯",)),
+        "蓝色": ("blue", "cup", "cylindrical_cup_v1", ("杯",)),
+        "紫色": ("purple", "block", "box_cube_v1", ("方块", "正方体", "立方体")),
+    }
 
     def infer(self, instruction: str) -> TaskIntent:
-        selected = [chinese for chinese in self.supported_colors if chinese in instruction]
-        if len(selected) != 1 or "杯" not in instruction or "托盘" not in instruction:
-            raise ValueError("当前 CAD 基线仅支持“抓取一种颜色杯子并放到托盘”的文本指令")
+        selected = [chinese for chinese in self.supported_targets if chinese in instruction]
+        if len(selected) != 1 or "托盘" not in instruction:
+            raise ValueError("当前 CAD 基线仅支持“抓取一种已登记颜色物体并放到托盘”的文本指令")
+        color, category, model_id, object_words = self.supported_targets[selected[0]]
+        if not any(word in instruction for word in object_words):
+            raise ValueError(f"指令中的物体类别与颜色“{selected[0]}”不一致")
         return TaskIntent(
             task="pick_and_place",
-            target_category="cup",
-            target_color=self.supported_colors[selected[0]],
+            target_category=category,
+            target_color=color,
+            target_model_id=model_id,
             destination_category="tray",
             confidence=1.0,
             source="rule_baseline",
@@ -111,6 +126,8 @@ class ColorThresholdSegmenter:
             # 深蓝灰地面也满足通道比例，故对蓝色增加绝对亮度门限；实际蓝杯的
             # 主色通道约为 177，而地面约为 111，仍保留足够的圆柱可见表面。
             "blue": (blue > 140) & (blue > red * 1.25) & (blue > green * 1.15),
+            # 紫色正方体要求红、蓝双通道都显著，避免把蓝灰地面或红杯阴影混入。
+            "purple": (red > 100) & (blue > 120) & (green < 110) & (red > green * 1.4) & (blue > green * 1.4),
         }
         component = self._largest_component(selectors[intent.target_color])
         rows, columns = np.nonzero(component)
@@ -134,14 +151,37 @@ class GraspTemplate:
 
 
 @dataclass(frozen=True)
-class CadModel:
+class CadGeometry:
     model_id: str
+    geometry_type: str
+    mesh_path: Path
+    vertices_object_m: np.ndarray
+    dimensions_m: np.ndarray
+    height_m: float
+    symmetry_type: str
+    grasp_templates: tuple[GraspTemplate, ...]
+
+
+@dataclass(frozen=True)
+class CatalogInstance:
+    scene_object_id: str
+    category: str
+    color: str
+    geometry_model_id: str
+
+
+@dataclass(frozen=True)
+class CadModel:
+    """通过语义实例解析出的可执行 CAD 模型。"""
+
+    model_id: str
+    geometry_type: str
     category: str
     color: str
     scene_object_id: str
     mesh_path: Path
     vertices_object_m: np.ndarray
-    radius_m: float
+    dimensions_m: np.ndarray
     height_m: float
     symmetry_type: str
     grasp_templates: tuple[GraspTemplate, ...]
@@ -160,6 +200,7 @@ class CadPoseEstimate:
     axial_yaw_observable: bool
     cylinder_axis_base: np.ndarray
     point_count: int
+    matching_method: str
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -175,7 +216,7 @@ class CadPoseEstimate:
             "cylinder_axis_base": self.cylinder_axis_base.tolist(),
             "axial_yaw_observable": self.axial_yaw_observable,
             "point_count": self.point_count,
-            "matching_method": "cad_cylinder_surface_sdf_grid_refinement",
+            "matching_method": self.matching_method,
         }
 
 
@@ -206,7 +247,13 @@ class ObjectCatalog:
         raw = json.loads(catalog_path.read_text())
         self._root = catalog_path.parent
         self._fixture = raw["static_fixture"]
-        self._models = tuple(self._load_model(item) for item in raw["models"])
+        self._geometries = {
+            geometry.model_id: geometry
+            for geometry in (self._load_geometry(item) for item in raw["geometry_models"])
+        }
+        self._instances = tuple(self._load_instance(item) for item in raw["instances"])
+        if len(self._geometries) != len(raw["geometry_models"]):
+            raise ValueError("对象目录的 geometry_models 中存在重复 model_id")
 
     @staticmethod
     def _load_obj_vertices(path: Path) -> np.ndarray:
@@ -219,10 +266,9 @@ class ObjectCatalog:
             raise ValueError(f"CAD 网格顶点不足：{path}")
         return np.asarray(vertices, dtype=np.float64)
 
-    def _load_model(self, raw: dict[str, object]) -> CadModel:
+    def _load_geometry(self, raw: dict[str, object]) -> CadGeometry:
         mesh_path = self._root / str(raw["mesh"])
         vertices = self._load_obj_vertices(mesh_path)
-        radial = np.linalg.norm(vertices[:, :2], axis=1)
         template_data = raw["grasp_templates"]
         templates = tuple(
             GraspTemplate(
@@ -235,28 +281,61 @@ class ObjectCatalog:
             )
             for template in template_data  # type: ignore[union-attr]
         )
-        attributes = raw["attributes"]  # type: ignore[assignment]
         symmetry = raw["symmetry"]  # type: ignore[assignment]
-        return CadModel(
+        dimensions = vertices.max(axis=0) - vertices.min(axis=0)
+        if np.any(dimensions <= 0.0):
+            raise ValueError(f"CAD 网格尺寸非法：{mesh_path}")
+        return CadGeometry(
             model_id=str(raw["model_id"]),
-            category=str(raw["category"]),
-            color=str(attributes["color"]),  # type: ignore[index]
-            scene_object_id=str(raw["scene_object_id"]),
+            geometry_type=str(raw["geometry_type"]),
             mesh_path=mesh_path,
             vertices_object_m=vertices,
-            radius_m=float(np.median(radial)),
-            height_m=float(vertices[:, 2].max() - vertices[:, 2].min()),
+            dimensions_m=dimensions,
+            height_m=float(dimensions[2]),
             symmetry_type=str(symmetry["type"]),  # type: ignore[index]
             grasp_templates=templates,
         )
 
+    @staticmethod
+    def _load_instance(raw: dict[str, object]) -> CatalogInstance:
+        attributes = raw["attributes"]  # type: ignore[assignment]
+        return CatalogInstance(
+            scene_object_id=str(raw["scene_object_id"]),
+            category=str(raw["category"]),
+            color=str(attributes["color"]),  # type: ignore[index]
+            geometry_model_id=str(raw["geometry_model_id"]),
+        )
+
     def find(self, intent: TaskIntent) -> CadModel:
         candidates = [
-            model for model in self._models if model.category == intent.target_category and model.color == intent.target_color
+            instance
+            for instance in self._instances
+            if instance.category == intent.target_category and instance.color == intent.target_color
         ]
         if len(candidates) != 1:
-            raise RuntimeError(f"对象目录未找到唯一 CAD 模型：{intent.target_category}/{intent.target_color}")
-        return candidates[0]
+            raise RuntimeError(f"对象目录未找到唯一场景实例：{intent.target_category}/{intent.target_color}")
+        instance = candidates[0]
+        if instance.geometry_model_id != intent.target_model_id:
+            raise RuntimeError(
+                "VLM 选定的 CAD 模型与对象目录不一致："
+                f"实例={instance.scene_object_id}，目录={instance.geometry_model_id}，VLM={intent.target_model_id}"
+            )
+        geometry = self._geometries.get(instance.geometry_model_id)
+        if geometry is None:
+            raise RuntimeError(f"场景实例引用了不存在的 CAD 模型：{instance.geometry_model_id}")
+        return CadModel(
+            model_id=geometry.model_id,
+            geometry_type=geometry.geometry_type,
+            category=instance.category,
+            color=instance.color,
+            scene_object_id=instance.scene_object_id,
+            mesh_path=geometry.mesh_path,
+            vertices_object_m=geometry.vertices_object_m,
+            dimensions_m=geometry.dimensions_m,
+            height_m=geometry.height_m,
+            symmetry_type=geometry.symmetry_type,
+            grasp_templates=geometry.grasp_templates,
+        )
 
     def fixture_collision_positions(self) -> dict[str, np.ndarray]:
         return {
@@ -321,6 +400,7 @@ class CylinderCadMatcher:
         return float(np.partition(distances, keep - 1)[:keep].mean())
 
     def _search(self, points: np.ndarray, initial: np.ndarray, step: float, span: float, model: CadModel) -> tuple[float, np.ndarray]:
+        radius = float(np.mean(model.dimensions_m[:2]) / 2.0)
         best_cost, best_center = float("inf"), initial.copy()
         offsets = np.arange(-span, span + step * 0.5, step)
         # 限制成本计算点数；被均匀抽样的点仍覆盖圆柱可见表面，保证 VNC 运行时延可控。
@@ -329,19 +409,20 @@ class CylinderCadMatcher:
             for dy in offsets:
                 for dz in offsets:
                     candidate = initial + np.array([dx, dy, dz])
-                    value = self._robust_cost(self._surface_distance(sample, candidate, model.radius_m, model.height_m))
+                    value = self._robust_cost(self._surface_distance(sample, candidate, radius, model.height_m))
                     if value < best_cost:
                         best_cost, best_center = value, candidate
         return best_cost, best_center
 
     def match(self, model: CadModel, segmentation: SegmentationResult, frame: UnifiedCameraFrame) -> CadPoseEstimate:
-        if model.symmetry_type != "axial":
+        if model.geometry_type != "cylinder" or model.symmetry_type != "axial":
             raise ValueError("当前首版仅支持轴对称圆柱 OBJ；通用网格匹配将在后续实现")
         points = _points_from_mask(frame, segmentation.mask)
+        radius = float(np.mean(model.dimensions_m[:2]) / 2.0)
         initial = np.median(points, axis=0)
         _, coarse = self._search(points, initial, step=0.005, span=0.050, model=model)
         _, center = self._search(points, coarse, step=0.001, span=0.006, model=model)
-        distances = self._surface_distance(points, center, model.radius_m, model.height_m)
+        distances = self._surface_distance(points, center, radius, model.height_m)
         residual = self._robust_cost(distances)
         inlier_ratio = float(np.mean(distances < 0.004))
         geometry_confidence = float(
@@ -366,7 +447,90 @@ class CylinderCadMatcher:
             axial_yaw_observable=False,
             cylinder_axis_base=np.array([0.0, 0.0, 1.0]),
             point_count=len(points),
+            matching_method="cad_cylinder_surface_sdf_grid_refinement",
         )
+
+
+class BoxCadMatcher:
+    """与桌面平行的正方体 CAD 表面匹配首版。
+
+    立方体的绕竖直轴旋转存在四重对称，首版只输出规范化的轴对齐方向；这不是
+    任意朝向网格配准的替代品。
+    """
+
+    @staticmethod
+    def _surface_distance(points: np.ndarray, center: np.ndarray, half_extents: np.ndarray) -> np.ndarray:
+        local = np.abs(points - center) - half_extents
+        outside = np.linalg.norm(np.maximum(local, 0.0), axis=1)
+        inside = np.minimum(np.max(local, axis=1), 0.0)
+        return np.abs(outside + inside)
+
+    @staticmethod
+    def _robust_cost(distances: np.ndarray) -> float:
+        keep = max(80, int(len(distances) * 0.70))
+        return float(np.partition(distances, keep - 1)[:keep].mean())
+
+    def _search(
+        self, points: np.ndarray, initial: np.ndarray, step: float, span: float, half_extents: np.ndarray
+    ) -> tuple[float, np.ndarray]:
+        best_cost, best_center = float("inf"), initial.copy()
+        offsets = np.arange(-span, span + step * 0.5, step)
+        sample = points[:: max(1, len(points) // 600)]
+        for dx in offsets:
+            for dy in offsets:
+                for dz in offsets:
+                    candidate = initial + np.array([dx, dy, dz])
+                    value = self._robust_cost(self._surface_distance(sample, candidate, half_extents))
+                    if value < best_cost:
+                        best_cost, best_center = value, candidate
+        return best_cost, best_center
+
+    def match(self, model: CadModel, segmentation: SegmentationResult, frame: UnifiedCameraFrame) -> CadPoseEstimate:
+        if model.geometry_type != "box" or model.symmetry_type != "discrete_z_4":
+            raise ValueError("BoxCadMatcher 仅支持带四重竖直轴对称声明的正方体")
+        points = _points_from_mask(frame, segmentation.mask)
+        half_extents = model.dimensions_m / 2.0
+        initial = np.median(points, axis=0)
+        _, coarse = self._search(points, initial, step=0.005, span=0.050, half_extents=half_extents)
+        _, center = self._search(points, coarse, step=0.001, span=0.006, half_extents=half_extents)
+        distances = self._surface_distance(points, center, half_extents)
+        residual = self._robust_cost(distances)
+        inlier_ratio = float(np.mean(distances < 0.004))
+        geometry_confidence = float(np.clip((1.0 - residual / 0.006) * inlier_ratio, 0.0, 1.0))
+        if residual > 0.006 or inlier_ratio < 0.55 or geometry_confidence < 0.45:
+            raise RuntimeError(
+                f"正方体 CAD 配准置信度不足：残差={residual:.4f}m，内点率={inlier_ratio:.3f}，"
+                f"几何置信度={geometry_confidence:.3f}"
+            )
+        transform = np.eye(4)
+        transform[:3, 3] = center
+        return CadPoseEstimate(
+            model_id=model.model_id,
+            position_base_m=center,
+            orientation_xyzw=np.array([0.0, 0.0, 0.0, 1.0]),
+            transform_base_object=transform,
+            surface_residual_m=residual,
+            inlier_ratio=inlier_ratio,
+            segmentation_confidence=segmentation.confidence,
+            geometry_confidence=geometry_confidence,
+            axial_yaw_observable=False,
+            cylinder_axis_base=np.array([0.0, 0.0, 1.0]),
+            point_count=len(points),
+            matching_method="cad_box_surface_sdf_grid_refinement",
+        )
+
+
+class CadMatcherDispatcher:
+    """按已校验的 CAD ``geometry_type`` 选择匹配器。"""
+
+    def __init__(self) -> None:
+        self._matchers = {"cylinder": CylinderCadMatcher(), "box": BoxCadMatcher()}
+
+    def match(self, model: CadModel, segmentation: SegmentationResult, frame: UnifiedCameraFrame) -> CadPoseEstimate:
+        matcher = self._matchers.get(model.geometry_type)
+        if matcher is None:
+            raise ValueError(f"未实现 geometry_type={model.geometry_type} 的 CAD 匹配器")
+        return matcher.match(model, segmentation, frame)
 
 
 def grasp_pose_from_template(pose: CadPoseEstimate, template: GraspTemplate) -> tuple[np.ndarray, np.ndarray]:
