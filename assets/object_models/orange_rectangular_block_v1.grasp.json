@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "model_id": "rectangular_block_v1",
+  "grasp_frames": [{
+    "frame_id": "top_down_long_side_v1",
+    "position_object_m": [0.0, 0.0, 0.105],
+    "orientation_object_xyzw": [1.0, 0.0, 0.0, 0.0],
+    "contact_regions": ["long_side_positive_y", "long_side_negative_y"],
+    "jaw_closing_axis_object": [0.0, 1.0, 0.0],
+    "opposing_contact_pair": {
+      "positive_surface": {
+        "region_id": "long_side_positive_y",
+        "normal_object": [0.0, 1.0, 0.0],
+        "center_object_m": [0.0, 0.0275, 0.0]
+      },
+      "negative_surface": {
+        "region_id": "long_side_negative_y",
+        "normal_object": [0.0, -1.0, 0.0],
+        "center_object_m": [0.0, -0.0275, 0.0]
+      }
+    },
+    "required_gripper_width_m": 0.070,
+    "approach_clearance_m": 0.12,
+    "lift_clearance_m": 0.20,
+    "quality": 1.0
+  }]
+}

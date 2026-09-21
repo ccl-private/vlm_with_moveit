@@ -14,6 +14,7 @@
 允许的“类别 + 颜色 + CAD 模型”组合：
 - `cup + red|green|blue + cylindrical_cup_v1`；
 - `block + purple + box_cube_v1`。
+- `block + magenta（洋红色）+ rectangular_block_v1`。
 允许目的地类别：`tray`。
 
 输入：
@@ -38,8 +39,8 @@
 - 成功时严格输出：
 {
   "task": "pick_and_place",
-  "target_query": {"category": "cup|block", "attributes": {"color": "red|green|blue|purple"}},
-  "target_model_id": "cylindrical_cup_v1|box_cube_v1",
+  "target_query": {"category": "cup|block", "attributes": {"color": "red|green|blue|purple|magenta"}},
+  "target_model_id": "cylindrical_cup_v1|box_cube_v1|rectangular_block_v1",
   "destination_query": {"category": "tray"},
   "confidence": 0.0,
   "source": "实际模型名称"

@@ -19,7 +19,7 @@ from .cad_matching import (
     CadMatcherDispatcher,
     ObjectCatalog,
     RuleVlmAdapter,
-    grasp_pose_from_template,
+    grasp_pose_candidates,
 )
 from .stage2_executor import MujocoTaskExecutor
 from .truth_baseline import MoveItTrajectoryClient, _execute_trajectory
@@ -63,21 +63,7 @@ def main() -> None:
         fixed_frame = simulation.cameras()["fixed"]
         segmentation = ColorThresholdSegmenter().segment(fixed_frame.rgb, intent)
         pose = CadMatcherDispatcher().match(model, segmentation, fixed_frame)
-        template = model.grasp_templates[0]
-        grasp_position, grasp_orientation = grasp_pose_from_template(pose, template)
-        # 当前 Panda 顶抓模板使用向下夹爪；任何目录模板方向不一致时应明确拒绝，
-        # 而不是静默忽略其 CAD 抓取姿态。
-        if not np.allclose(grasp_orientation, np.array([1.0, 0.0, 0.0, 0.0]), atol=1e-6):
-            raise RuntimeError("当前 MoveIt 桥接仅支持向下顶抓模板方向")
-        placement = catalog.physical_placement_targets(model, template)
-        tray_center = placement.tray_center_base_m
-        targets = [
-            ("pregrasp", grasp_position + np.array([0.0, 0.0, template.approach_clearance_m])),
-            ("approach", grasp_position),
-            ("lift", grasp_position + np.array([0.0, 0.0, template.lift_clearance_m])),
-            ("place_above", placement.gripper_above_base_m),
-            ("place_descend", placement.gripper_release_base_m),
-        ]
+        candidates = grasp_pose_candidates(pose, model.grasp_templates)
         # 正常档以仿真时间一倍速运行；VNC 只显示该节拍，不通过渲染 sleep 改变它。
         executor = MujocoTaskExecutor(simulation, frame_callback=render_frame, realtime_factor=1.0)
         executor.set_display_state(f"CAD match complete: {target_object_id} / {model.model_id}")
@@ -90,19 +76,72 @@ def main() -> None:
             time.sleep(1.0)
             motion_wall_start = time.monotonic()
             executor.set_gripper(opened=True)
-            for stage, target in targets[:2]:
-                executor.set_display_state(f"CAD grasp / MoveIt: {stage}")
+            selected = None
+            rejected_candidates: list[dict[str, str]] = []
+            for candidate_template, candidate_position, candidate_orientation in candidates:
+                pregrasp = candidate_position + np.array([0.0, 0.0, candidate_template.approach_clearance_m])
+                executor.set_display_state(f"CAD candidate / MoveIt: {candidate_template.template_id}")
                 client.publish_joint_state(executor.joint_positions())
-                _execute_trajectory(executor, client.request(target))
-                executor._event(f"moveit_{stage}_complete")
+                try:
+                    pregrasp_trajectory = client.request(pregrasp, candidate_orientation)
+                except TimeoutError as error:
+                    rejected_candidates.append({"frame_id": candidate_template.template_id, "reason": str(error)})
+                    continue
+                selected = (candidate_template, candidate_position, candidate_orientation, pregrasp_trajectory)
+                break
+            if selected is None:
+                raise RuntimeError(f"MoveIt 未找到可执行的 CAD 抓取标注候选：{rejected_candidates}")
+            template, grasp_position, grasp_orientation, pregrasp_trajectory = selected
+            placement = catalog.physical_placement_targets(model, template)
+            tray_center = placement.tray_center_base_m
+            targets = [
+                ("approach", grasp_position),
+                ("lift", grasp_position + np.array([0.0, 0.0, template.lift_clearance_m])),
+                ("place_above", placement.gripper_above_base_m),
+                ("place_descend", placement.gripper_release_base_m),
+            ]
+            executor.set_display_state("CAD grasp / MoveIt: pregrasp")
+            _execute_trajectory(executor, pregrasp_trajectory)
+            executor._event("moveit_pregrasp_complete")
+            executor.set_display_state("CAD grasp / MoveIt: approach")
+            client.publish_joint_state(executor.joint_positions())
+            _execute_trajectory(executor, client.request(grasp_position, grasp_orientation))
+            executor._event(
+                "moveit_approach_complete",
+                hand_x=float(executor.body_position("hand")[0]),
+                hand_y=float(executor.body_position("hand")[1]),
+                hand_z=float(executor.body_position("hand")[2]),
+                object_x=float(executor.body_position(target_object_id)[0]),
+                object_y=float(executor.body_position(target_object_id)[1]),
+                object_z=float(executor.body_position(target_object_id)[2]),
+            )
             executor.set_display_state("Gripper: close and stable attach CAD target")
             executor.set_gripper(opened=False)
-            executor.attach(target_object_id)
-            for stage, target in targets[2:]:
+            closing_axis_base = pose.transform_base_object[:3, :3] @ template.jaw_closing_axis_object
+            pair = template.opposing_contact_pair
+            executor.attach(
+                target_object_id,
+                closing_axis_base,
+                (
+                    pair.positive_surface.center_object_m,
+                    pair.positive_surface.normal_object,
+                    pair.negative_surface.center_object_m,
+                    pair.negative_surface.normal_object,
+                ),
+            )
+            for stage, target in targets[1:]:
                 executor.set_display_state(f"CAD grasp / MoveIt: {stage} with {target_object_id}")
                 client.publish_joint_state(executor.joint_positions())
-                _execute_trajectory(executor, client.request(target))
-                executor._event(f"moveit_{stage}_complete")
+                _execute_trajectory(executor, client.request(target, grasp_orientation))
+                executor._event(
+                    f"moveit_{stage}_complete",
+                    hand_x=float(executor.body_position("hand")[0]),
+                    hand_y=float(executor.body_position("hand")[1]),
+                    hand_z=float(executor.body_position("hand")[2]),
+                    object_x=float(executor.body_position(target_object_id)[0]),
+                    object_y=float(executor.body_position(target_object_id)[1]),
+                    object_z=float(executor.body_position(target_object_id)[2]),
+                )
             executor.set_display_state("Gripper: physical release above tray")
             executor.set_gripper(opened=True)
             physical_release = executor.release_physical()
@@ -128,6 +167,30 @@ def main() -> None:
                 },
                 "pose_estimate": pose.as_dict(),
                 "grasp_position_base_m": grasp_position.tolist(),
+                "grasp_orientation_base_xyzw": grasp_orientation.tolist(),
+                "grasp_annotation": {
+                    "frame_id": template.template_id,
+                    "contact_regions": list(template.contact_regions),
+                    "jaw_closing_axis_object": template.jaw_closing_axis_object.tolist(),
+                    "opposing_contact_pair": {
+                        "positive_surface": {
+                            "region_id": template.opposing_contact_pair.positive_surface.region_id,
+                            "normal_object": template.opposing_contact_pair.positive_surface.normal_object.tolist(),
+                            "center_object_m": template.opposing_contact_pair.positive_surface.center_object_m.tolist(),
+                        },
+                        "negative_surface": {
+                            "region_id": template.opposing_contact_pair.negative_surface.region_id,
+                            "normal_object": template.opposing_contact_pair.negative_surface.normal_object.tolist(),
+                            "center_object_m": template.opposing_contact_pair.negative_surface.center_object_m.tolist(),
+                        },
+                    },
+                    "quality": template.quality,
+                },
+                "grasp_candidate_selection": {
+                    "candidate_count": len(candidates),
+                    "selected_frame_id": template.template_id,
+                    "rejected_candidates": rejected_candidates,
+                },
                 "fixture_tray_center_base_m": tray_center.tolist(),
                 "physical_placement": placement.as_dict(),
                 "physical_release": physical_release.as_dict(),

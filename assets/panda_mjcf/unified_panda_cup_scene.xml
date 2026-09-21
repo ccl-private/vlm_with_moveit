@@ -19,6 +19,7 @@
     <material name="cup_blue" rgba="0.08 0.29 0.85 1"/>
     <!-- 颜色是场景实例属性；它不写入正方体 CAD 网格。 -->
     <material name="cube_purple" rgba="0.60 0.08 0.78 1"/>
+    <material name="block_magenta" rgba="0.88 0.05 0.72 1"/>
   </asset>
 
   <worldbody>
@@ -51,6 +52,11 @@
       <freejoint name="purple_cube_freejoint"/>
       <geom name="purple_cube_geom" type="box" size="0.035 0.035 0.035" material="cube_purple" mass="0.12" friction="1.2 0.01 0.001"/>
     </body>
+    <!-- 位于固定相机前景，避免被杯子遮挡，同时保持 Panda 抬升可达。 -->
+    <body name="magenta_block" pos="0.45 -0.32 0.425" quat="0.962425 0 0 0.271547">
+      <freejoint name="magenta_block_freejoint"/>
+      <geom name="magenta_block_geom" type="box" size="0.070 0.0275 0.030" material="block_magenta" mass="0.12" friction="1.2 0.01 0.001"/>
+    </body>
 
     <!-- 托盘位于 Panda 下向抓取姿态的可达区；其精确位置同时登记在对象目录中。 -->
     <body name="tray" pos="0.52 0.25 0.45">
@@ -65,5 +71,14 @@
     <camera name="camera_global" mode="targetbody" target="table" pos="1.55 -1.35 1.35" fovy="48"/>
     <camera name="camera_fixed" mode="targetbody" target="table" pos="0.35 -1.18 1.35" fovy="52"/>
   </worldbody>
+
+  <!-- 仅在控制器确认左右指尖都接触后运行时激活；初始均不参与约束。 -->
+  <equality>
+    <weld name="grasp_red_cup" body1="hand" body2="red_cup" active="false" solref="0.05 1" solimp="0.90 0.98 0.001"/>
+    <weld name="grasp_green_cup" body1="hand" body2="green_cup" active="false" solref="0.05 1" solimp="0.90 0.98 0.001"/>
+    <weld name="grasp_blue_cup" body1="hand" body2="blue_cup" active="false" solref="0.05 1" solimp="0.90 0.98 0.001"/>
+    <weld name="grasp_purple_cube" body1="hand" body2="purple_cube" active="false" solref="0.05 1" solimp="0.90 0.98 0.001"/>
+    <weld name="grasp_magenta_block" body1="hand" body2="magenta_block" active="false" solref="0.05 1" solimp="0.90 0.98 0.001"/>
+  </equality>
 
 </mujoco>

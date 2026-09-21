@@ -74,7 +74,7 @@ class MujocoTaskExecutor:
     """阶段 2 的唯一 MuJoCo 执行入口；夹取附着与事件在此原子处理。"""
 
     arm_joint_names = tuple(f"joint{index}" for index in range(1, 8))
-    graspable_object_names = ("red_cup", "green_cup", "blue_cup", "purple_cube")
+    graspable_object_names = ("red_cup", "green_cup", "blue_cup", "purple_cube", "magenta_block")
 
     def __init__(
         self,
@@ -86,8 +86,6 @@ class MujocoTaskExecutor:
             raise ValueError("实时回放倍率必须为正数或 None")
         self.simulation = simulation
         self.attached_object: str | None = None
-        self._grasp_relative_position: np.ndarray | None = None
-        self._grasp_relative_rotation: np.ndarray | None = None
         self.events: list[SimulationEvent] = []
         self.frame_callback = frame_callback
         self.display_state = "Preparing"
@@ -129,40 +127,12 @@ class MujocoTaskExecutor:
             time.sleep(remaining)
 
     def _advance_one_step(self) -> None:
-        """推进一个物理步，并按统一策略处理附着、显示和真实时间节拍。"""
+        """推进一个物理步；抓取物体仅由接触确认后启用的 MuJoCo 约束保持。"""
         mujoco.mj_step(self.simulation.model, self.simulation.data)
-        self._hold_attached_object()
         self._step_count += 1
         self._pace_realtime()
         if self._step_count % self._render_interval_steps == 0:
             self._render_frame()
-
-    def _hold_attached_object(self) -> None:
-        """以末端相对位姿稳定保持已确认夹取的杯子。
-
-        Panda 资产中的自由杯与 weld equality 在启用瞬间会产生较大约束冲量，
-        不适合这一阶段的确定性抓取基线。这里采用混合抓取模型：路径仍由
-        MoveIt 规划、夹爪事件仍完整记录，而被确认夹取的物体以运动学方式
-        随末端移动；释放后立即恢复普通刚体与托盘接触。
-        """
-        if self.attached_object is None:
-            return
-        if self._grasp_relative_position is None or self._grasp_relative_rotation is None:
-            raise RuntimeError("夹取相对位姿缺失")
-        model, data = self.simulation.model, self.simulation.data
-        hand_id = model.body("hand").id
-        hand_rotation = data.xmat[hand_id].reshape(3, 3)
-        world_position = data.xpos[hand_id] + hand_rotation @ self._grasp_relative_position
-        world_rotation = hand_rotation @ self._grasp_relative_rotation
-        world_quaternion = np.empty(4)
-        mujoco.mju_mat2Quat(world_quaternion, world_rotation.ravel())
-        joint_id = model.joint(f"{self.attached_object}_freejoint").id
-        qpos_address = model.jnt_qposadr[joint_id]
-        dof_address = model.jnt_dofadr[joint_id]
-        data.qpos[qpos_address : qpos_address + 3] = world_position
-        data.qpos[qpos_address + 3 : qpos_address + 7] = world_quaternion
-        data.qvel[dof_address : dof_address + 6] = 0.0
-        mujoco.mj_forward(model, data)
 
     def joint_positions(self) -> dict[str, float]:
         model, data = self.simulation.model, self.simulation.data
@@ -170,6 +140,10 @@ class MujocoTaskExecutor:
             name: float(data.qpos[model.jnt_qposadr[model.joint(name).id]])
             for name in self.arm_joint_names
         }
+
+    def body_position(self, body_name: str) -> np.ndarray:
+        """返回当前仿真机体位置，仅用于执行遥测，绝不参与控制决策。"""
+        return self.simulation.data.xpos[self.simulation.model.body(body_name).id].copy()
 
     def execute_joint_target(self, target: dict[str, float], duration_s: float) -> None:
         """以位置控制器回放一段 MoveIt 关节目标；执行器不生成关节轨迹。"""
@@ -239,6 +213,10 @@ class MujocoTaskExecutor:
                 for name, target, current in zip(self.arm_joint_names, target_positions, previous_positions)
             )
             duration_s = max(raw_duration_s / speed_scale, speed_limited_duration_s)
+            # 已经通过双侧接触确认抓取后，额外载荷与约束会显著提高腕部惯性；
+            # 降速而非放宽跟踪误差门限，保持物理夹持阶段的稳定性与可审计性。
+            if self.attached_object is not None:
+                duration_s *= 3.0
             # 首个 MoveIt 路点通常是 t=0 的当前姿态；若不是，也至少经过一个物理步。
             steps = max(1, int(np.ceil(duration_s / model.opt.timestep)))
             effective_duration_s = steps * model.opt.timestep
@@ -280,7 +258,7 @@ class MujocoTaskExecutor:
             )
         return summary
 
-    def set_gripper(self, opened: bool, settle_s: float = 0.25) -> None:
+    def set_gripper(self, opened: bool, settle_s: float = 0.80) -> None:
         """控制 Panda 手指；0 为闭合，255 为张开（上游 Panda MJCF 的控制范围）。"""
         self.simulation.data.ctrl[7] = 255.0 if opened else 0.0
         steps = max(1, int(np.ceil(settle_s / self.simulation.model.opt.timestep)))
@@ -288,8 +266,13 @@ class MujocoTaskExecutor:
             self._advance_one_step()
         self._event("gripper_open" if opened else "gripper_close")
 
-    def attach(self, object_name: str) -> None:
-        """确认夹取后记录稳定的末端—物体相对位姿。"""
+    def attach(
+        self,
+        object_name: str,
+        expected_closing_axis_base: np.ndarray | None = None,
+        opposing_contact_pair_object: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
+    ) -> None:
+        """仅在双侧真实接触、轴对齐且（CAD 路径中）落在相对面后确认物理夹持。"""
         if object_name not in self.graspable_object_names:
             raise ValueError(f"不支持附着的对象：{object_name}")
         if self.attached_object is not None:
@@ -297,13 +280,83 @@ class MujocoTaskExecutor:
         model, data = self.simulation.model, self.simulation.data
         hand_id, object_id = model.body("hand").id, model.body(object_name).id
         hand_rotation = data.xmat[hand_id].reshape(3, 3)
+        actual_axis = hand_rotation[:, 1]
+        alignment = float("nan")
+        if expected_closing_axis_base is not None:
+            expected_axis = np.asarray(expected_closing_axis_base, dtype=np.float64)
+            expected_axis /= np.linalg.norm(expected_axis)
+            alignment = abs(float(np.dot(actual_axis, expected_axis)))
+            if alignment < 0.95:
+                raise RuntimeError(f"夹爪闭合轴未与 CAD 标注面法向对齐：|dot|={alignment:.3f}")
+        left_id, right_id = model.body("left_finger").id, model.body("right_finger").id
+        left_contact = right_contact = 0
+        object_rotation = data.xmat[object_id].reshape(3, 3)
+        left_contact_points_object: list[np.ndarray] = []
+        right_contact_points_object: list[np.ndarray] = []
+        for index in range(data.ncon):
+            contact = data.contact[index]
+            body_a, body_b = model.geom_bodyid[contact.geom1], model.geom_bodyid[contact.geom2]
+            bodies = {int(body_a), int(body_b)}
+            if object_id not in bodies:
+                continue
+            point_object = object_rotation.T @ (contact.pos - data.xpos[object_id])
+            if left_id in bodies:
+                left_contact += 1
+                left_contact_points_object.append(point_object)
+            if right_id in bodies:
+                right_contact += 1
+                right_contact_points_object.append(point_object)
+        if left_contact == 0 or right_contact == 0:
+            raise RuntimeError(
+                f"夹爪未形成双侧真实接触：left={left_contact}，right={right_contact}；拒绝伪附着"
+            )
+        matched_opposing_faces = "not_checked"
+        if opposing_contact_pair_object is not None:
+            positive_center, positive_normal, negative_center, negative_normal = (
+                np.asarray(value, dtype=np.float64) for value in opposing_contact_pair_object
+            )
+
+            def touches_surface(points: list[np.ndarray], center: np.ndarray, normal: np.ndarray) -> bool:
+                # 接触点位于指尖与物体的交界处；0.015 m 同时覆盖 pad 厚度和求解器软接触误差。
+                return any(abs(float(np.dot(point - center, normal))) <= 0.015 for point in points)
+
+            left_positive = touches_surface(left_contact_points_object, positive_center, positive_normal)
+            left_negative = touches_surface(left_contact_points_object, negative_center, negative_normal)
+            right_positive = touches_surface(right_contact_points_object, positive_center, positive_normal)
+            right_negative = touches_surface(right_contact_points_object, negative_center, negative_normal)
+            if not ((left_positive and right_negative) or (left_negative and right_positive)):
+                raise RuntimeError(
+                    "左右指尖接触没有分别落在 CAD 标注的相对面："
+                    f"left(+/-)=({left_positive}/{left_negative})，"
+                    f"right(+/-)=({right_positive}/{right_negative})；"
+                    f"left_points_object={np.round(left_contact_points_object, 4).tolist()}；"
+                    f"right_points_object={np.round(right_contact_points_object, 4).tolist()}"
+                )
+            matched_opposing_faces = "passed"
         relative_position = hand_rotation.T @ (data.xpos[object_id] - data.xpos[hand_id])
         relative_rotation = hand_rotation.T @ data.xmat[object_id].reshape(3, 3)
+        relative_quaternion = np.empty(4)
+        mujoco.mju_mat2Quat(relative_quaternion, relative_rotation.ravel())
+        equality_id = model.equality(f"grasp_{object_name}").id
+        # 每次夹取都以已验证的当前接触相对位姿初始化 weld；不重写自由关节状态。
+        # MuJoCo weld 的 11 个 eq_data 字段依次为：body2 锚点、body1 锚点、
+        # body2 相对 body1 的四元数、torquescale。以物体原点作为 body2 锚点，
+        # 并把同一点在 hand 局部系的位置写入 body1 锚点；旧实现误把四元数写进
+        # 锚点槽，导致物体在抬升中被拉向错误位置。
+        model.eq_data[equality_id, :3] = 0.0
+        model.eq_data[equality_id, 3:6] = relative_position
+        model.eq_data[equality_id, 6:10] = relative_quaternion
+        # 0.04 m 近似两侧指尖形成的有效夹持接触面尺度：保留姿态保持，且避免
+        # 过大的角约束力矩干扰腕部轨迹。
+        model.eq_data[equality_id, 10] = 0.04
+        data.eq_active[equality_id] = 1
+        mujoco.mj_forward(model, data)
         self.attached_object = object_name
-        self._grasp_relative_position = relative_position.copy()
-        self._grasp_relative_rotation = relative_rotation.copy()
-        self._hold_attached_object()
-        self._event("grasp_attached", object_id=object_name, method="kinematic_hold")
+        self._event(
+            "grasp_attached", object_id=object_name, method="physical_fingertip_contact_and_weld",
+            left_contacts=float(left_contact), right_contacts=float(right_contact), closing_axis_alignment=alignment,
+            opposing_contact_pair=matched_opposing_faces,
+        )
 
     def release_physical(self, settle_s: float = 0.75) -> PhysicalReleaseSummary:
         """在当前夹爪位置解除附着，再完全交由 MuJoCo 接触动力学放置。"""
@@ -313,16 +366,17 @@ class MujocoTaskExecutor:
             raise ValueError("物理稳定时间必须为正数")
         model, data = self.simulation.model, self.simulation.data
         object_name = self.attached_object
+        equality_id = model.equality(f"grasp_{object_name}").id
         joint_id = model.joint(f"{object_name}_freejoint").id
         qpos_address = model.jnt_qposadr[joint_id]
         dof_address = model.jnt_dofadr[joint_id]
         release_position = data.qpos[qpos_address : qpos_address + 3].copy()
         release_quaternion = data.qpos[qpos_address + 3 : qpos_address + 7].copy()
-        # 这里故意不写 qpos/qvel：物体保持夹爪带至的当前自由关节状态并自然下落。
+        # 禁用已验证接触后启用的 MuJoCo weld；这里故意不写 qpos/qvel。
+        data.eq_active[equality_id] = 0
+        mujoco.mj_forward(model, data)
         self._event("grasp_released_physical", object_id=object_name, qpos_reset=0.0, qvel_reset=0.0)
         self.attached_object = None
-        self._grasp_relative_position = None
-        self._grasp_relative_rotation = None
         for _ in range(max(1, int(np.ceil(settle_s / model.opt.timestep)))):
             self._advance_one_step()
         summary = PhysicalReleaseSummary(

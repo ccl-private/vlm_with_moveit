@@ -47,10 +47,17 @@ class RuleVlmAdapter:
         "绿色": ("green", "cup", "cylindrical_cup_v1", ("杯",)),
         "蓝色": ("blue", "cup", "cylindrical_cup_v1", ("杯",)),
         "紫色": ("purple", "block", "box_cube_v1", ("方块", "正方体", "立方体")),
+        "洋红色": ("magenta", "block", "rectangular_block_v1", ("方块", "长方体", "长条")),
     }
 
     def infer(self, instruction: str) -> TaskIntent:
-        selected = [chinese for chinese in self.supported_targets if chinese in instruction]
+        raw_selected = [chinese for chinese in self.supported_targets if chinese in instruction]
+        # “洋红色”等复合颜色词包含“红色”；保留更具体的最长颜色词，避免把它
+        # 误判为两个目标。真实 VLM 接入后由结构化枚举校验承担同一职责。
+        selected = [
+            chinese for chinese in raw_selected
+            if not any(chinese != other and chinese in other for other in raw_selected)
+        ]
         if len(selected) != 1 or "托盘" not in instruction:
             raise ValueError("当前 CAD 基线仅支持“抓取一种已登记颜色物体并放到托盘”的文本指令")
         color, category, model_id, object_words = self.supported_targets[selected[0]]
@@ -128,6 +135,7 @@ class ColorThresholdSegmenter:
             "blue": (blue > 140) & (blue > red * 1.25) & (blue > green * 1.15),
             # 紫色正方体要求红、蓝双通道都显著，避免把蓝灰地面或红杯阴影混入。
             "purple": (red > 100) & (blue > 120) & (green < 110) & (red > green * 1.4) & (blue > green * 1.4),
+            "magenta": (red > 115) & (blue > 95) & (green < 105) & (red > green * 1.35) & (blue > green * 1.35),
         }
         component = self._largest_component(selectors[intent.target_color])
         rows, columns = np.nonzero(component)
@@ -141,6 +149,23 @@ class ColorThresholdSegmenter:
 
 
 @dataclass(frozen=True)
+class ContactSurface:
+    """CAD 坐标系中允许一片指尖接触的表面。"""
+
+    region_id: str
+    normal_object: np.ndarray
+    center_object_m: np.ndarray
+
+
+@dataclass(frozen=True)
+class OpposingContactPair:
+    """一次平行夹爪抓取所需的两片相对接触面。"""
+
+    positive_surface: ContactSurface
+    negative_surface: ContactSurface
+
+
+@dataclass(frozen=True)
 class GraspTemplate:
     template_id: str
     position_object_m: np.ndarray
@@ -148,6 +173,10 @@ class GraspTemplate:
     approach_clearance_m: float
     lift_clearance_m: float
     required_gripper_width_m: float
+    contact_regions: tuple[str, ...]
+    jaw_closing_axis_object: np.ndarray
+    opposing_contact_pair: OpposingContactPair
+    quality: float
 
 
 @dataclass(frozen=True)
@@ -201,6 +230,7 @@ class CadPoseEstimate:
     cylinder_axis_base: np.ndarray
     point_count: int
     matching_method: str
+    object_yaw_rad: float | None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -217,6 +247,7 @@ class CadPoseEstimate:
             "axial_yaw_observable": self.axial_yaw_observable,
             "point_count": self.point_count,
             "matching_method": self.matching_method,
+            "object_yaw_rad": self.object_yaw_rad,
         }
 
 
@@ -269,22 +300,30 @@ class ObjectCatalog:
     def _load_geometry(self, raw: dict[str, object]) -> CadGeometry:
         mesh_path = self._root / str(raw["mesh"])
         vertices = self._load_obj_vertices(mesh_path)
-        template_data = raw["grasp_templates"]
+        annotation_path = self._root / str(raw["grasp_annotation"])
+        annotation = json.loads(annotation_path.read_text())
+        if annotation.get("model_id") != raw["model_id"]:
+            raise ValueError(f"抓取标注与 CAD 模型 ID 不一致：{annotation_path}")
+        dimensions = vertices.max(axis=0) - vertices.min(axis=0)
+        if np.any(dimensions <= 0.0):
+            raise ValueError(f"CAD 网格尺寸非法：{mesh_path}")
+        template_data = annotation["grasp_frames"]
         templates = tuple(
             GraspTemplate(
-                template_id=str(template["template_id"]),
+                template_id=str(template["frame_id"]),
                 position_object_m=np.asarray(template["position_object_m"], dtype=np.float64),
                 orientation_object_xyzw=np.asarray(template["orientation_object_xyzw"], dtype=np.float64),
                 approach_clearance_m=float(template["approach_clearance_m"]),
                 lift_clearance_m=float(template["lift_clearance_m"]),
                 required_gripper_width_m=float(template["required_gripper_width_m"]),
+                contact_regions=tuple(str(item) for item in template["contact_regions"]),
+                jaw_closing_axis_object=np.asarray(template["jaw_closing_axis_object"], dtype=np.float64),
+                opposing_contact_pair=self._load_opposing_contact_pair(template, dimensions),
+                quality=float(template["quality"]),
             )
             for template in template_data  # type: ignore[union-attr]
         )
         symmetry = raw["symmetry"]  # type: ignore[assignment]
-        dimensions = vertices.max(axis=0) - vertices.min(axis=0)
-        if np.any(dimensions <= 0.0):
-            raise ValueError(f"CAD 网格尺寸非法：{mesh_path}")
         return CadGeometry(
             model_id=str(raw["model_id"]),
             geometry_type=str(raw["geometry_type"]),
@@ -295,6 +334,49 @@ class ObjectCatalog:
             symmetry_type=str(symmetry["type"]),  # type: ignore[index]
             grasp_templates=templates,
         )
+
+    @staticmethod
+    def _load_opposing_contact_pair(raw: dict[str, object], dimensions_m: np.ndarray) -> OpposingContactPair:
+        """加载并严格校验两个可夹表面确实相对且正交于闭合轴。"""
+        pair = raw.get("opposing_contact_pair")
+        if not isinstance(pair, dict):
+            raise ValueError("抓取标注缺少 opposing_contact_pair；平行夹爪必须标注一对相对面")
+
+        def load_surface(key: str) -> ContactSurface:
+            surface = pair.get(key)
+            if not isinstance(surface, dict):
+                raise ValueError(f"抓取标注缺少 {key}")
+            region_id = str(surface.get("region_id", ""))
+            normal = np.asarray(surface.get("normal_object"), dtype=np.float64)
+            center = np.asarray(surface.get("center_object_m"), dtype=np.float64)
+            if not region_id or normal.shape != (3,) or center.shape != (3,):
+                raise ValueError(f"抓取标注的 {key} 格式无效")
+            norm = float(np.linalg.norm(normal))
+            if norm < 1e-9:
+                raise ValueError(f"抓取标注的 {key} 法向量不能为零")
+            if np.any(np.abs(center) > dimensions_m / 2.0 + 1e-6):
+                raise ValueError(f"抓取标注的 {key} 中心超出 CAD 包围盒")
+            return ContactSurface(region_id, normal / norm, center)
+
+        positive = load_surface("positive_surface")
+        negative = load_surface("negative_surface")
+        regions = tuple(str(item) for item in raw.get("contact_regions", ()))
+        axis = np.asarray(raw.get("jaw_closing_axis_object"), dtype=np.float64)
+        axis_norm = float(np.linalg.norm(axis))
+        if axis.shape != (3,) or axis_norm < 1e-9:
+            raise ValueError("抓取标注的 jaw_closing_axis_object 无效")
+        axis = axis / axis_norm
+        if positive.region_id == negative.region_id or set(regions) != {positive.region_id, negative.region_id}:
+            raise ValueError("contact_regions 必须恰好列出 opposing_contact_pair 的两片不同表面")
+        if float(np.dot(positive.normal_object, negative.normal_object)) > -0.995:
+            raise ValueError("平行夹爪的两片接触面法向必须相反")
+        if float(np.dot(positive.normal_object, axis)) < 0.995 or float(np.dot(negative.normal_object, axis)) > -0.995:
+            raise ValueError("两片接触面法向必须分别与夹爪闭合轴正向和反向对齐")
+        separation = positive.center_object_m - negative.center_object_m
+        separation_norm = float(np.linalg.norm(separation))
+        if separation_norm < 1e-4 or float(np.dot(separation / separation_norm, axis)) < 0.995:
+            raise ValueError("两片接触面中心必须沿夹爪闭合轴相对分布")
+        return OpposingContactPair(positive, negative)
 
     @staticmethod
     def _load_instance(raw: dict[str, object]) -> CatalogInstance:
@@ -352,10 +434,15 @@ class ObjectCatalog:
         center = np.asarray(tray["position_base_m"], dtype=np.float64)
         floor_z_offset = float(tray["floor_z_offset_m"])
         drop_clearance = float(tray["drop_clearance_m"])
+        minimum_gripper_release_clearance = float(tray["minimum_gripper_release_clearance_m"])
         approach_clearance = float(tray["place_approach_clearance_m"])
         object_center = center + np.array([0.0, 0.0, floor_z_offset + model.height_m / 2.0 + drop_clearance])
-        # 本阶段已限定对象竖直、抓取模板为顶部垂直接近；因此对象坐标的模板平移与基座轴对齐。
+        # 抓取框可以为侧夹而降低掌心；托盘释放高度则必须独立满足手掌/手指不撞托盘的安全间隙。
+        # 此阶段限定物体竖直、接近方向竖直，故只在 Z 上施加这个工装安全下限。
         gripper_release = object_center + template.position_object_m
+        gripper_release[2] = max(
+            gripper_release[2], object_center[2] + minimum_gripper_release_clearance
+        )
         gripper_above = gripper_release + np.array([0.0, 0.0, approach_clearance])
         return PhysicalPlacementTargets(
             tray_center_base_m=center,
@@ -448,6 +535,7 @@ class CylinderCadMatcher:
             cylinder_axis_base=np.array([0.0, 0.0, 1.0]),
             point_count=len(points),
             matching_method="cad_cylinder_surface_sdf_grid_refinement",
+            object_yaw_rad=None,
         )
 
 
@@ -459,8 +547,12 @@ class BoxCadMatcher:
     """
 
     @staticmethod
-    def _surface_distance(points: np.ndarray, center: np.ndarray, half_extents: np.ndarray) -> np.ndarray:
-        local = np.abs(points - center) - half_extents
+    def _surface_distance(
+        points: np.ndarray, center: np.ndarray, half_extents: np.ndarray, yaw_rad: float = 0.0
+    ) -> np.ndarray:
+        cosine, sine = np.cos(yaw_rad), np.sin(yaw_rad)
+        rotation = np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
+        local = np.abs((points - center) @ rotation) - half_extents
         outside = np.linalg.norm(np.maximum(local, 0.0), axis=1)
         inside = np.minimum(np.max(local, axis=1), 0.0)
         return np.abs(outside + inside)
@@ -471,7 +563,7 @@ class BoxCadMatcher:
         return float(np.partition(distances, keep - 1)[:keep].mean())
 
     def _search(
-        self, points: np.ndarray, initial: np.ndarray, step: float, span: float, half_extents: np.ndarray
+        self, points: np.ndarray, initial: np.ndarray, step: float, span: float, half_extents: np.ndarray, yaw_rad: float
     ) -> tuple[float, np.ndarray]:
         best_cost, best_center = float("inf"), initial.copy()
         offsets = np.arange(-span, span + step * 0.5, step)
@@ -480,20 +572,34 @@ class BoxCadMatcher:
             for dy in offsets:
                 for dz in offsets:
                     candidate = initial + np.array([dx, dy, dz])
-                    value = self._robust_cost(self._surface_distance(sample, candidate, half_extents))
+                    value = self._robust_cost(self._surface_distance(sample, candidate, half_extents, yaw_rad))
                     if value < best_cost:
                         best_cost, best_center = value, candidate
         return best_cost, best_center
 
     def match(self, model: CadModel, segmentation: SegmentationResult, frame: UnifiedCameraFrame) -> CadPoseEstimate:
-        if model.geometry_type != "box" or model.symmetry_type != "discrete_z_4":
-            raise ValueError("BoxCadMatcher 仅支持带四重竖直轴对称声明的正方体")
+        if model.geometry_type != "box" or model.symmetry_type not in {"discrete_z_4", "discrete_z_2", "none"}:
+            raise ValueError("BoxCadMatcher 仅支持桌面水平的 box CAD 模型")
         points = _points_from_mask(frame, segmentation.mask)
         half_extents = model.dimensions_m / 2.0
         initial = np.median(points, axis=0)
-        _, coarse = self._search(points, initial, step=0.005, span=0.050, half_extents=half_extents)
-        _, center = self._search(points, coarse, step=0.001, span=0.006, half_extents=half_extents)
-        distances = self._surface_distance(points, center, half_extents)
+        square_xy = abs(model.dimensions_m[0] - model.dimensions_m[1]) < 0.002
+        yaw_rad = 0.0
+        if not square_xy:
+            centered_xy = points[:, :2] - np.median(points[:, :2], axis=0)
+            _, vectors = np.linalg.eigh(np.cov(centered_xy.T))
+            major = vectors[:, -1]
+            pca_yaw = float(np.arctan2(major[1], major[0]))
+            sample = points[:: max(1, len(points) // 500)]
+            yaw_candidates = pca_yaw + np.arange(-0.35, 0.351, 0.04)
+            yaw_rad = float(min(yaw_candidates, key=lambda yaw: self._robust_cost(self._surface_distance(sample, initial, half_extents, float(yaw)))))
+        _, coarse = self._search(points, initial, step=0.005, span=0.050, half_extents=half_extents, yaw_rad=yaw_rad)
+        if not square_xy:
+            sample = points[:: max(1, len(points) // 500)]
+            yaw_candidates = yaw_rad + np.arange(-0.06, 0.061, 0.005)
+            yaw_rad = float(min(yaw_candidates, key=lambda yaw: self._robust_cost(self._surface_distance(sample, coarse, half_extents, float(yaw)))))
+        _, center = self._search(points, coarse, step=0.001, span=0.006, half_extents=half_extents, yaw_rad=yaw_rad)
+        distances = self._surface_distance(points, center, half_extents, yaw_rad)
         residual = self._robust_cost(distances)
         inlier_ratio = float(np.mean(distances < 0.004))
         geometry_confidence = float(np.clip((1.0 - residual / 0.006) * inlier_ratio, 0.0, 1.0))
@@ -503,11 +609,13 @@ class BoxCadMatcher:
                 f"几何置信度={geometry_confidence:.3f}"
             )
         transform = np.eye(4)
+        cosine, sine = np.cos(yaw_rad), np.sin(yaw_rad)
+        transform[:3, :3] = np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
         transform[:3, 3] = center
         return CadPoseEstimate(
             model_id=model.model_id,
             position_base_m=center,
-            orientation_xyzw=np.array([0.0, 0.0, 0.0, 1.0]),
+            orientation_xyzw=np.array([0.0, 0.0, np.sin(yaw_rad / 2.0), np.cos(yaw_rad / 2.0)]),
             transform_base_object=transform,
             surface_residual_m=residual,
             inlier_ratio=inlier_ratio,
@@ -517,6 +625,7 @@ class BoxCadMatcher:
             cylinder_axis_base=np.array([0.0, 0.0, 1.0]),
             point_count=len(points),
             matching_method="cad_box_surface_sdf_grid_refinement",
+            object_yaw_rad=None if square_xy else yaw_rad,
         )
 
 
@@ -534,7 +643,42 @@ class CadMatcherDispatcher:
 
 
 def grasp_pose_from_template(pose: CadPoseEstimate, template: GraspTemplate) -> tuple[np.ndarray, np.ndarray]:
-    """将对象坐标系下的 CAD 顶抓模板变换为基座系末端目标。"""
+    """将对象标注抓取框变换为 MoveIt ``panda_hand`` 目标。
+
+    标注的朝向以 MuJoCo 指尖 pad 实际夹持坐标系表达；Panda 的 MoveIt
+    ``panda_hand`` 与该 body 固定相差绕 Z 轴 45°，故在此统一施加 TCP
+    外参，不能分散写入每个 CAD 的抓取标注。
+    """
     rotation = pose.transform_base_object[:3, :3]
     position = pose.position_base_m + rotation @ template.position_object_m
-    return position, template.orientation_object_xyzw.copy()
+    ox, oy, oz, ow = pose.orientation_xyzw
+    tx, ty, tz, tw = template.orientation_object_xyzw
+    orientation = np.array([
+        ow * tx + ox * tw + oy * tz - oz * ty,
+        ow * ty - ox * tz + oy * tw + oz * tx,
+        ow * tz + ox * ty - oy * tx + oz * tw,
+        ow * tw - ox * tx - oy * ty - oz * tz,
+    ])
+    orientation /= np.linalg.norm(orientation)
+    # q_target = q_pad_grasp * q_z(+45°)，xyzw 格式。
+    tcp_offset = np.array([0.0, 0.0, np.sin(np.pi / 8.0), np.cos(np.pi / 8.0)])
+    ox, oy, oz, ow = orientation
+    tx, ty, tz, tw = tcp_offset
+    target_orientation = np.array([
+        ow * tx + ox * tw + oy * tz - oz * ty,
+        ow * ty - ox * tz + oy * tw + oz * tx,
+        ow * tz + ox * ty - oy * tx + oz * tw,
+        ow * tw - ox * tx - oy * ty - oz * tz,
+    ])
+    return position, target_orientation / np.linalg.norm(target_orientation)
+
+
+def grasp_pose_candidates(
+    pose: CadPoseEstimate, templates: tuple[GraspTemplate, ...]
+) -> list[tuple[GraspTemplate, np.ndarray, np.ndarray]]:
+    """将同一 CAD 的全部抓取标注变换到基座系并按质量降序排列。"""
+    return sorted(
+        [(template, *grasp_pose_from_template(pose, template)) for template in templates],
+        key=lambda item: item[0].quality,
+        reverse=True,
+    )

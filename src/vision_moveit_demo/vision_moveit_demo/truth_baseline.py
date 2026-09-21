@@ -52,6 +52,7 @@ class MoveItTrajectoryClient(Node):
             "green_cup": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
             "blue_cup": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
             "purple_cube": (SolidPrimitive.BOX, [0.07, 0.07, 0.07]),
+            "magenta_block": (SolidPrimitive.BOX, [0.14, 0.055, 0.06]),
         }
         # MoveIt 服务会跨回合常驻。若上回合的非目标杯在场景中、而本回合它成为
         # 抓取目标，必须先删除其旧碰撞体；否则规划器会把将要抓取的杯子视作障碍物。
@@ -80,15 +81,17 @@ class MoveItTrajectoryClient(Node):
             scene.world.collision_objects.append(object_message)
         self.scene_publisher.publish(scene)
 
-    def request(self, position: np.ndarray, timeout_s: float = 15.0) -> RobotTrajectory:
+    def request(
+        self, position: np.ndarray, orientation_xyzw: np.ndarray | None = None, timeout_s: float = 15.0
+    ) -> RobotTrajectory:
         previous_count = len(self.trajectories)
         target = PoseStamped()
         target.header.frame_id = "panda_link0"
         target.header.stamp = self.get_clock().now().to_msg()
         target.pose.position.x, target.pose.position.y, target.pose.position.z = map(float, position)
-        # Panda 手朝下，夹爪朝向桌面。
-        target.pose.orientation.x = 1.0
-        target.pose.orientation.w = 0.0
+        # 未指定时保持历史基线的向下夹爪；CAD 抓取标注可传入完整 6D 姿态。
+        orientation = np.array([1.0, 0.0, 0.0, 0.0]) if orientation_xyzw is None else orientation_xyzw
+        target.pose.orientation.x, target.pose.orientation.y, target.pose.orientation.z, target.pose.orientation.w = map(float, orientation)
         self.trajectory_publisher.publish(target)
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:

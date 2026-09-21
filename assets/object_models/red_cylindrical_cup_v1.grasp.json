@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "model_id": "cylindrical_cup_v1",
+  "grasp_frames": [{
+    "frame_id": "top_down_center_v1",
+    "position_object_m": [0.0, 0.0, 0.10],
+    "orientation_object_xyzw": [1.0, 0.0, 0.0, 0.0],
+    "contact_regions": ["outer_wall_positive_y", "outer_wall_negative_y"],
+    "jaw_closing_axis_object": [0.0, 1.0, 0.0],
+    "opposing_contact_pair": {
+      "positive_surface": {
+        "region_id": "outer_wall_positive_y",
+        "normal_object": [0.0, 1.0, 0.0],
+        "center_object_m": [0.0, 0.038, 0.0]
+      },
+      "negative_surface": {
+        "region_id": "outer_wall_negative_y",
+        "normal_object": [0.0, -1.0, 0.0],
+        "center_object_m": [0.0, -0.038, 0.0]
+      }
+    },
+    "required_gripper_width_m": 0.076,
+    "approach_clearance_m": 0.12,
+    "lift_clearance_m": 0.20,
+    "quality": 1.0
+  }]
+}
