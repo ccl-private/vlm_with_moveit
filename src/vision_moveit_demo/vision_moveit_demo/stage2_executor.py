@@ -81,9 +81,12 @@ class MujocoTaskExecutor:
         simulation: UnifiedPandaCupSimulation,
         frame_callback: Callable[[str], bool] | None = None,
         realtime_factor: float | None = None,
+        attached_speed_scale: float = 6.0,
     ) -> None:
         if realtime_factor is not None and realtime_factor <= 0.0:
             raise ValueError("实时回放倍率必须为正数或 None")
+        if attached_speed_scale <= 0.0:
+            raise ValueError("携物阶段降速系数必须为正数")
         self.simulation = simulation
         self.attached_object: str | None = None
         self.events: list[SimulationEvent] = []
@@ -91,6 +94,7 @@ class MujocoTaskExecutor:
         self.display_state = "Preparing"
         self._render_interval_steps = max(1, int(round(1.0 / (30.0 * simulation.model.opt.timestep))))
         self.realtime_factor = realtime_factor
+        self.attached_speed_scale = attached_speed_scale
         self._realtime_wall_origin: float | None = None
         self._realtime_simulation_origin: float | None = None
         self._step_count = 0
@@ -216,7 +220,7 @@ class MujocoTaskExecutor:
             # 已经通过双侧接触确认抓取后，额外载荷与约束会显著提高腕部惯性；
             # 降速而非放宽跟踪误差门限，保持物理夹持阶段的稳定性与可审计性。
             if self.attached_object is not None:
-                duration_s *= 6.0
+                duration_s *= self.attached_speed_scale
             # 首个 MoveIt 路点通常是 t=0 的当前姿态；若不是，也至少经过一个物理步。
             steps = max(1, int(np.ceil(duration_s / model.opt.timestep)))
             effective_duration_s = steps * model.opt.timestep

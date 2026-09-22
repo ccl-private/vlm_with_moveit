@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -30,6 +31,57 @@ def _save_ppm(path: Path, rgb: np.ndarray) -> None:
     with path.open("wb") as output:
         output.write(f"P6\n{rgb.shape[1]} {rgb.shape[0]}\n255\n".encode())
         output.write(rgb.tobytes())
+
+
+class _Mp4Recorder:
+    """通过 ffmpeg 将 RGB 帧编码为 MP4，不阻塞 MuJoCo 控制循环。"""
+
+    def __init__(self, path: Path, width: int, height: int, fps: int = 30) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.process = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                f"{width}x{height}",
+                "-r",
+                str(fps),
+                "-i",
+                "-",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(path),
+            ],
+            stdin=subprocess.PIPE,
+        )
+
+    def write(self, rgb: np.ndarray) -> None:
+        if self.process.stdin is None:
+            raise RuntimeError(f"视频录制管道不可用：{self.path}")
+        frame = np.ascontiguousarray(rgb, dtype=np.uint8)
+        try:
+            self.process.stdin.write(frame.tobytes())
+        except BrokenPipeError as error:
+            raise RuntimeError(f"ffmpeg 无法写入视频：{self.path}") from error
+
+    def close(self) -> None:
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        return_code = self.process.wait()
+        if return_code != 0:
+            raise RuntimeError(f"ffmpeg 录制失败（退出码 {return_code}）：{self.path}")
 
 
 def _save_stage1_snapshot(path: Path, simulation: UnifiedPandaCupSimulation) -> None:
@@ -62,7 +114,12 @@ def _save_stage1_snapshot(path: Path, simulation: UnifiedPandaCupSimulation) -> 
 class VncOverlayViewer:
     """不依赖父项目的最小 GLFW/MuJoCo viewer，含两个实时相机叠加图。"""
 
-    def __init__(self, simulation: UnifiedPandaCupSimulation, title: str = "MoveIt 阶段 1") -> None:
+    def __init__(
+        self,
+        simulation: UnifiedPandaCupSimulation,
+        title: str = "MoveIt 阶段 1",
+        video_dir: Path | None = None,
+    ) -> None:
         import glfw
         import mujoco
 
@@ -106,6 +163,13 @@ class VncOverlayViewer:
         self.scene = mujoco.MjvScene(simulation.model, maxgeom=2000)
         self.context = mujoco.MjrContext(simulation.model, mujoco.mjtFontScale.mjFONTSCALE_150)
         self.show_depth = False
+        self.video_recorders: tuple[_Mp4Recorder, _Mp4Recorder] | None = None
+        if video_dir is not None:
+            self.video_recorders = (
+                _Mp4Recorder(video_dir / "main.mp4", simulation.width, simulation.height),
+                _Mp4Recorder(video_dir / "wrist.mp4", simulation.width, simulation.height),
+            )
+            print(f"[视频] 正在保存两路 MP4：{video_dir / 'main.mp4'}、{video_dir / 'wrist.mp4'}", flush=True)
         glfw.set_key_callback(self.window, self._on_key)
         print("[阶段 1] VNC 窗口已创建；正在渲染（D：深度，R：重置，Esc：退出）。", flush=True)
 
@@ -149,9 +213,18 @@ class VncOverlayViewer:
         # 复用感知链已创建的渲染器。VirtualGL 下若额外创建离屏 renderer，跨两个
         # GLFW 窗口的纹理上下文会变成全黑；此处只取两路所需 RGB（D 键才取深度）。
         self.glfw.make_context_current(self.window)
-        frames = self.simulation.cameras(("fixed", "wrist"), include_depth=self.show_depth)
+        frames = self.simulation.cameras(("global", "fixed", "wrist"), include_depth=self.show_depth)
+        global_rgb = frames["global"].rgb if not self.show_depth else _depth_rgb(frames["global"].depth)
         fixed = _depth_rgb(frames["fixed"].depth) if self.show_depth else frames["fixed"].rgb
         wrist = _depth_rgb(frames["wrist"].depth) if self.show_depth else frames["wrist"].rgb
+        if self.video_recorders is not None:
+            main_video = global_rgb.copy()
+            inset_width = main_video.shape[1] // 4
+            inset_height = int(inset_width * main_video.shape[0] / main_video.shape[1])
+            inset = _resize_nearest(fixed, inset_height, inset_width)
+            main_video[16 : 16 + inset_height, main_video.shape[1] - inset_width - 16 : -16] = inset
+            self.video_recorders[0].write(main_video)
+            self.video_recorders[1].write(wrist)
         self.glfw.make_context_current(self.window)
         width, height = self.glfw.get_framebuffer_size(self.window)
         viewport = self.mujoco.MjrRect(0, 0, width, height)
@@ -182,6 +255,10 @@ class VncOverlayViewer:
 
     def close(self) -> None:
         """释放 VNC 专用上下文；允许任务脚本在窗口关闭后干净退出。"""
+        if self.video_recorders is not None:
+            for recorder in self.video_recorders:
+                recorder.close()
+            self.video_recorders = None
         self.context.free()
         self.wrist_context.free()
         self.glfw.destroy_window(self.wrist_window)
@@ -199,6 +276,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="统一 Panda 场景的 VNC 双相机预览")
     parser.add_argument("--root", type=Path, default=Path(os.environ["MOVEIT_EXPERIMENT_ROOT"]))
     parser.add_argument("--headless", action="store_true", help="不创建窗口，只写入三路首帧。")
+    parser.add_argument("--video-dir", type=Path, help="保存 main.mp4 和 wrist.mp4 的目录。")
     arguments = parser.parse_args()
     mode = "离屏验收" if arguments.headless else "VNC 实时预览"
     print(f"[阶段 1] 正在加载统一场景（{mode}）…", flush=True)
@@ -215,7 +293,7 @@ def main() -> None:
             _save_stage1_snapshot(output / "stage1_snapshot.json", simulation)
             print(f"已写入统一场景三路相机首帧：{output}")
             return
-        viewer = VncOverlayViewer(simulation)
+        viewer = VncOverlayViewer(simulation, video_dir=arguments.video_dir)
         print("[阶段 1] 正在初始化三路 RGB-D 渲染器…", flush=True)
         simulation.initialize_renderers()
         viewer.glfw.make_context_current(viewer.window)

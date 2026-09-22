@@ -38,6 +38,13 @@ def main() -> None:
     parser.add_argument("--instruction", default="抓取红色杯子并放到托盘")
     parser.add_argument("--root", type=Path, default=Path(os.environ["MOVEIT_EXPERIMENT_ROOT"]))
     parser.add_argument("--vnc", action="store_true", help="在 VNC 中显示 CAD 匹配驱动的执行过程。")
+    parser.add_argument("--video-dir", type=Path, help="保存 VNC 主视角和腕部相机 MP4 的目录。")
+    parser.add_argument(
+        "--attached-speed-scale",
+        type=float,
+        default=6.0,
+        help="夹住物体后的轨迹时长倍率，默认 6.0；数值越小越快。",
+    )
     arguments = parser.parse_args()
 
     simulation = UnifiedPandaCupSimulation(arguments.root, create_renderers=False)
@@ -45,7 +52,11 @@ def main() -> None:
     if arguments.vnc:
         from .unified_preview import VncOverlayViewer
 
-        viewer = VncOverlayViewer(simulation, title="MoveIt 阶段 3 CAD 模型匹配")
+        viewer = VncOverlayViewer(
+            simulation,
+            title="MoveIt 阶段 3 CAD 模型匹配",
+            video_dir=arguments.video_dir,
+        )
         simulation.initialize_renderers()
         viewer.glfw.make_context_current(viewer.window)
         def render_frame(state: str) -> bool:
@@ -93,7 +104,12 @@ def main() -> None:
                 flush=True,
             )
         # 正常档以仿真时间一倍速运行；VNC 只显示该节拍，不通过渲染 sleep 改变它。
-        executor = MujocoTaskExecutor(simulation, frame_callback=render_frame, realtime_factor=1.0)
+        executor = MujocoTaskExecutor(
+            simulation,
+            frame_callback=render_frame,
+            realtime_factor=1.0,
+            attached_speed_scale=arguments.attached_speed_scale,
+        )
         executor.set_display_state(f"CAD match complete: {target_object_id} / {model.model_id}")
         rclpy.init()
         client = MoveItTrajectoryClient()
