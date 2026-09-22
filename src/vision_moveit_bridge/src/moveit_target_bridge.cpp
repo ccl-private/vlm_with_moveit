@@ -61,12 +61,17 @@ class MoveItTargetBridge : public rclcpp::Node {
       publish_status("规划桥尚未初始化，拒绝目标");
       return;
     }
-    if (target.header.frame_id != "panda_link0" && target.header.frame_id != "base_link") {
+    const bool position_only = target.header.frame_id == "panda_link0_position_only";
+    if (target.header.frame_id != "panda_link0" && target.header.frame_id != "base_link" && !position_only) {
       publish_status("目标坐标系错误，必须为 panda_link0 或 base_link");
       return;
     }
     set_start_state_from_simulation();
-    move_group_->setPoseTarget(target.pose);
+    if (position_only) {
+      move_group_->setPositionTarget(target.pose.position.x, target.pose.position.y, target.pose.position.z);
+    } else {
+      move_group_->setPoseTarget(target.pose);
+    }
     moveit::planning_interface::MoveGroupInterface::Plan plan;
     const auto result = move_group_->plan(plan);
     move_group_->clearPoseTargets();
@@ -75,6 +80,8 @@ class MoveItTargetBridge : public rclcpp::Node {
       publish_status("MoveIt 规划失败");
       return;
     }
+    // 透传请求时间戳，客户端据此拒绝后台规划线程迟到发布的旧轨迹。
+    plan.trajectory.joint_trajectory.header.stamp = target.header.stamp;
     trajectory_publisher_->publish(plan.trajectory);
     if (!execute_in_simulation_) {
       publish_status("MoveIt 规划成功，已发布关节轨迹（未执行）");

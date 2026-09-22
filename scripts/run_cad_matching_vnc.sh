@@ -30,4 +30,17 @@ echo "[阶段 3] 正在进行 RGB-D → CAD 模型匹配，并打开 VNC 任务�
 if [[ "$#" == "0" ]]; then
   set -- --instruction "抓取红色杯子并放到托盘"
 fi
-ROS_DOMAIN_ID="$ros_domain_id" ./scripts/run_cad_matching.sh --vnc "$@"
+set +e
+# 同时保留完整的任务端输出。此前只有规划服务日志，Python 端的超时/异常在
+# 图形进程异常退出时容易丢失，VNC 终端也看不到具体是哪一个阶段失败。
+task_log="${log_dir}/task_latest.log"
+ROS_DOMAIN_ID="$ros_domain_id" ./scripts/run_cad_matching.sh --vnc "$@" 2>&1 | tee "$task_log"
+task_status=${PIPESTATUS[0]}
+set -e
+if [[ "$task_status" != "0" ]]; then
+  echo "[阶段 3] 任务端完整日志：${task_log}" >&2
+  tail -n 160 "$task_log" >&2 || true
+  echo "[阶段 3] 任务失败；以下是 MoveIt 服务末尾日志（用于直接定位 IK、碰撞或目标状态异常）：" >&2
+  tail -n 120 "${log_dir}/moveit_latest.log" >&2 || true
+fi
+exit "$task_status"

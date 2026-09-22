@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "model_id": "cylindrical_cup_v1",
+  "model_id": "cylindrical_object_v1",
   "grasp_frames": [{
     "frame_id": "top_down_center_v1",
     "position_object_m": [0.0, 0.0, 0.10],

@@ -285,10 +285,12 @@
     <general class="panda" name="actuator6" joint="joint6" gainprm="2000" biasprm="0 -2000 -200" forcerange="-1000 1000"
       ctrlrange="-0.0175 3.7525"/>
     <general class="panda" name="actuator7" joint="joint7" gainprm="2000" biasprm="0 -2000 -200" forcerange="-1000 1000"/>
-    <!-- 将 ctrl 0..255 映射为每侧手指行程 0..0.04 m。刚度为 1000 时，
-         gain 必须为 0.04 * 1000 / 255；否则 255 只会张开 4 mm。 -->
-    <general class="panda" name="actuator8" tendon="split" forcerange="-100 100" ctrlrange="0 255"
-      gainprm="0.15686274510 0 0" biasprm="0 -1000 -30"/>
+    <!-- 将 ctrl 0..255 映射为每侧手指行程 0..0.04 m。对薄把手采用较柔顺的
+         闭合刚度，避免单侧先碰撞时把目标推出夹爪；gain 保持同一行程映射。 -->
+    <!-- 夹爪保持力受限：若把手未位于两指之间，单侧接触不能用大力把杯子
+         推偏或压穿；CAD 双侧接触校验会拒绝这种情况。 -->
+    <general class="panda" name="actuator8" tendon="split" forcerange="-80 80" ctrlrange="0 255"
+      gainprm="0.15686274510 0 0" biasprm="0 -1000 -8"/>
   </actuator>
 
   <keyframe>

@@ -40,7 +40,12 @@ class MoveItTrajectoryClient(Node):
         positions["table"] = np.array([0.725, 0.0, 0.36])
         self.publish_scene_positions(positions, grasp_target=grasp_target)
 
-    def publish_scene_positions(self, positions: dict[str, np.ndarray], grasp_target: str | None = None) -> None:
+    def publish_scene_positions(
+        self,
+        positions: dict[str, np.ndarray],
+        grasp_target: str | None = None,
+        temporary_exclusions: tuple[str, ...] = (),
+    ) -> None:
         """发布显式场景坐标；视觉闭环调用方不得传入 MuJoCo 真值快照。"""
         scene = PlanningScene(is_diff=True)
         dimensions = {
@@ -48,25 +53,31 @@ class MoveItTrajectoryClient(Node):
             # 否则完整桌板会与其固定底座/立柱相交，使起始状态非法。
             "table": (SolidPrimitive.BOX, [0.85, 0.96, 0.07]),
             "tray": (SolidPrimitive.BOX, [0.26, 0.22, 0.094]),
-            "red_cup": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
-            "green_cup": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
-            "blue_cup": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
+            "red_cylinder": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
+            "green_cylinder": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
+            "blue_cylinder": (SolidPrimitive.CYLINDER, [0.14, 0.038]),
             "purple_cube": (SolidPrimitive.BOX, [0.07, 0.07, 0.07]),
             "magenta_block": (SolidPrimitive.BOX, [0.14, 0.055, 0.06]),
+            # 预抓取阶段只需阻止路径横穿杯身。用实际杯身圆柱而非包住把手
+            # 与空腔的实心大盒，避免在把手上方的合法预抓取位被误判为碰撞。
+            "yellow_mug": (SolidPrimitive.CYLINDER, [0.10, 0.033]),
+            "mug_pedestal": (SolidPrimitive.BOX, [0.28, 0.24, 0.08]),
+            "tray_pedestal": (SolidPrimitive.BOX, [0.36, 0.30, 0.08]),
         }
-        # MoveIt 服务会跨回合常驻。若上回合的非目标杯在场景中、而本回合它成为
-        # 抓取目标，必须先删除其旧碰撞体；否则规划器会把将要抓取的杯子视作障碍物。
+        # 任务脚本每回合启动独立的规划服务。这里直接省略目标和临时排除件即可；
+        # 不能对一个尚不存在的 CollisionObject 发 REMOVE，否则 MoveIt 会拒绝
+        # 整个 PlanningScene diff，表面上看像是 IK/可达性故障。
+        excluded = set(temporary_exclusions)
         if grasp_target is not None:
             if grasp_target not in dimensions:
                 raise ValueError(f"未知抓取目标：{grasp_target}")
-            remove_target = CollisionObject()
-            remove_target.id = f"stage2_{grasp_target}"
-            remove_target.header.frame_id = "panda_link0"
-            remove_target.operation = CollisionObject.REMOVE
-            scene.world.collision_objects.append(remove_target)
+            excluded.add(grasp_target)
+        for excluded_name in sorted(excluded):
+            if excluded_name not in dimensions:
+                raise ValueError(f"未知的临时碰撞排除对象：{excluded_name}")
         for name, (shape_type, shape_dimensions) in dimensions.items():
             # 接近阶段允许末端与目标杯建立接触；其它杯子、桌面和托盘仍进入碰撞场景。
-            if name == grasp_target:
+            if name in excluded:
                 continue
             object_message = CollisionObject()
             object_message.id = f"stage2_{name}"
@@ -82,23 +93,39 @@ class MoveItTrajectoryClient(Node):
         self.scene_publisher.publish(scene)
 
     def request(
-        self, position: np.ndarray, orientation_xyzw: np.ndarray | None = None, timeout_s: float = 15.0
+        self,
+        position: np.ndarray,
+        orientation_xyzw: np.ndarray | None = None,
+        timeout_s: float = 15.0,
+        position_only: bool = False,
     ) -> RobotTrajectory:
-        previous_count = len(self.trajectories)
         target = PoseStamped()
-        target.header.frame_id = "panda_link0"
+        target.header.frame_id = "panda_link0_position_only" if position_only else "panda_link0"
         target.header.stamp = self.get_clock().now().to_msg()
         target.pose.position.x, target.pose.position.y, target.pose.position.z = map(float, position)
         # 未指定时保持历史基线的向下夹爪；CAD 抓取标注可传入完整 6D 姿态。
         orientation = np.array([1.0, 0.0, 0.0, 0.0]) if orientation_xyzw is None else orientation_xyzw
         target.pose.orientation.x, target.pose.orientation.y, target.pose.orientation.z, target.pose.orientation.w = map(float, orientation)
+        print(
+            "[MoveIt 请求] "
+            f"位置=({position[0]:.4f}, {position[1]:.4f}, {position[2]:.4f})，"
+            f"四元数_xyzw=({orientation[0]:.4f}, {orientation[1]:.4f}, {orientation[2]:.4f}, {orientation[3]:.4f})，"
+            f"模式={'仅位置' if position_only else '完整姿态'}，超时={timeout_s:.1f}s",
+            flush=True,
+        )
+        # 串行任务在发送前清空已处理轨迹；部分 ROS 发行版会重写 trajectory header
+        # 的时间戳，故不能把它作为唯一关联键。
+        self.trajectories.clear()
         self.trajectory_publisher.publish(target)
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
-            if len(self.trajectories) > previous_count:
+            if self.trajectories:
                 return self.trajectories[-1]
-        raise TimeoutError("等待 MoveIt 规划轨迹超时")
+        raise TimeoutError(
+            "等待 MoveIt 规划轨迹超时；请查看同一终端中紧邻的 [MoveIt 请求] 目标位姿，"
+            "以及 VNC 启动脚本随后打印的 MoveIt 服务末尾日志（其中包含 GOAL_STATE_INVALID、碰撞或 IK 原因）"
+        )
 
 
 def _execute_trajectory(executor: MujocoTaskExecutor, trajectory: RobotTrajectory) -> None:
@@ -151,17 +178,17 @@ def main() -> None:
         # ROS 2 默认话题为易失 QoS；先等待发现完成，避免首个场景/目标消息丢失。
         time.sleep(3.0)
         if os.environ.get("STAGE2_SKIP_COLLISION_SCENE") != "1":
-            client.publish_scene(simulation.synchronization_snapshot(), grasp_target="red_cup")
+            client.publish_scene(simulation.synchronization_snapshot(), grasp_target="red_cylinder")
             time.sleep(1.0)
-        cup = simulation.evaluation_only_truth("red_cup")
+        cylinder = simulation.evaluation_only_truth("red_cylinder")
         tray = simulation.evaluation_only_truth("tray")
         # 阶段 2 允许读取托盘真值作单元测试，但实际放置仍必须在当前位置物理松爪，
         # 不能把物体自由关节改写到托盘中。
         release_hand = tray + np.array([0.0, 0.0, 0.194])
         targets = [
             ("pregrasp", np.array([0.45, 0.0, 0.55])),
-            ("approach", cup + np.array([0.0, 0.0, 0.10])),
-            ("lift", cup + np.array([0.0, 0.0, 0.30])),
+            ("approach", cylinder + np.array([0.0, 0.0, 0.10])),
+            ("lift", cylinder + np.array([0.0, 0.0, 0.30])),
             ("place_above", release_hand + np.array([0.0, 0.0, 0.12])),
             ("place_descend", release_hand),
         ]
@@ -171,18 +198,18 @@ def main() -> None:
             client.publish_joint_state(executor.joint_positions())
             _execute_trajectory(executor, client.request(target))
             executor._event(f"moveit_{stage}_complete")
-        executor.set_display_state("Gripper: close and attach red cup")
+        executor.set_display_state("Gripper: close and attach red cylinder")
         executor.set_gripper(opened=False)
-        executor.attach("red_cup")
+        executor.attach("red_cylinder")
         for stage, target in targets[2:]:
-            executor.set_display_state(f"MoveIt: {stage} with red cup")
+            executor.set_display_state(f"MoveIt: {stage} with red cylinder")
             client.publish_joint_state(executor.joint_positions())
             _execute_trajectory(executor, client.request(target))
             executor._event(f"moveit_{stage}_complete")
         executor.set_display_state("Gripper: physical release above tray")
         executor.set_gripper(opened=True)
         executor.release_physical()
-        success = executor.object_in_tray("red_cup", tray)
+        success = executor.object_in_tray("red_cylinder", tray)
         payload = {
             "instruction": arguments.instruction,
             "stage": "truth_task_baseline",
@@ -197,7 +224,7 @@ def main() -> None:
             raise RuntimeError("杯子未落入托盘")
         if viewer is not None:
             print("任务成功。VNC 中按 Esc 关闭两个窗口后程序退出。", flush=True)
-            while viewer.render_once("Success: red cup in tray"):
+            while viewer.render_once("Success: red cylinder in tray"):
                 time.sleep(1.0 / 30.0)
     finally:
         client.destroy_node()

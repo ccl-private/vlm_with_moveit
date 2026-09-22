@@ -1,0 +1,29 @@
+{
+  "schema_version": 2,
+  "model_id": "mug_with_handle_v1",
+  "grasp_frames": [{
+    "frame_id": "handle_horizontal_pinch_v1",
+    "grasp_region": "handle",
+    "position_object_m": [0.005, 0.074, 0.000],
+    "orientation_object_xyzw": [0.70710678, -0.70710678, 0.0, 0.0],
+    "contact_regions": ["handle_outer_bar_left_x", "handle_outer_bar_right_x"],
+    "contact_collision_geometries": ["yellow_mug_handle_outer_collision"],
+    "jaw_closing_axis_object": [1.0, 0.0, 0.0],
+    "opposing_contact_pair": {
+      "positive_surface": {
+        "region_id": "handle_outer_bar_left_x",
+        "normal_object": [1.0, 0.0, 0.0],
+        "center_object_m": [0.006, 0.074, 0.0]
+      },
+      "negative_surface": {
+        "region_id": "handle_outer_bar_right_x",
+        "normal_object": [-1.0, 0.0, 0.0],
+        "center_object_m": [-0.006, 0.074, 0.0]
+      }
+    },
+    "required_gripper_width_m": 0.022,
+    "approach_clearance_m": 0.10,
+    "lift_clearance_m": 0.12,
+    "quality": 1.0
+  }]
+}

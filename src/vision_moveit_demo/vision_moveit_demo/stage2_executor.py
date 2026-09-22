@@ -74,7 +74,7 @@ class MujocoTaskExecutor:
     """阶段 2 的唯一 MuJoCo 执行入口；夹取附着与事件在此原子处理。"""
 
     arm_joint_names = tuple(f"joint{index}" for index in range(1, 8))
-    graspable_object_names = ("red_cup", "green_cup", "blue_cup", "purple_cube", "magenta_block")
+    graspable_object_names = ("red_cylinder", "green_cylinder", "blue_cylinder", "purple_cube", "magenta_block", "yellow_mug")
 
     def __init__(
         self,
@@ -216,7 +216,7 @@ class MujocoTaskExecutor:
             # 已经通过双侧接触确认抓取后，额外载荷与约束会显著提高腕部惯性；
             # 降速而非放宽跟踪误差门限，保持物理夹持阶段的稳定性与可审计性。
             if self.attached_object is not None:
-                duration_s *= 3.0
+                duration_s *= 6.0
             # 首个 MoveIt 路点通常是 t=0 的当前姿态；若不是，也至少经过一个物理步。
             steps = max(1, int(np.ceil(duration_s / model.opt.timestep)))
             effective_duration_s = steps * model.opt.timestep
@@ -266,11 +266,68 @@ class MujocoTaskExecutor:
             self._advance_one_step()
         self._event("gripper_open" if opened else "gripper_close")
 
+    def close_until_dual_contact(
+        self,
+        object_name: str,
+        timeout_s: float = 5.0,
+        required_object_geometries: tuple[str, ...] = (),
+    ) -> None:
+        """闭爪时逐步检测双侧接触，首次形成稳定夹持即停止继续挤压。
+
+        对薄把手而言，“完全闭合后再看接触”会将目标推出夹爪。本方法只负责
+        时序控制；随后 ``attach`` 仍会校验 CAD 相对接触面和闭合轴。
+        """
+        if object_name not in self.graspable_object_names:
+            raise ValueError(f"不支持附着的对象：{object_name}")
+        model, data = self.simulation.model, self.simulation.data
+        object_id = model.body(object_name).id
+        left_id, right_id = model.body("left_finger").id, model.body("right_finger").id
+        data.ctrl[7] = 0.0
+        steps = max(1, int(np.ceil(timeout_s / model.opt.timestep)))
+        for _ in range(steps):
+            self._advance_one_step()
+            left_contact = right_contact = False
+            for contact in data.contact[: data.ncon]:
+                contact_names = {model.geom(contact.geom1).name, model.geom(contact.geom2).name}
+                if required_object_geometries and not contact_names.intersection(required_object_geometries):
+                    continue
+                bodies = {int(model.geom_bodyid[contact.geom1]), int(model.geom_bodyid[contact.geom2])}
+                if object_id in bodies:
+                    left_contact = left_contact or left_id in bodies
+                    right_contact = right_contact or right_id in bodies
+            if left_contact and right_contact:
+                self._event("gripper_dual_contact", object_name=object_name)
+                return
+        finger_geoms = []
+        for geom_id, body_id in enumerate(model.geom_bodyid):
+            if int(body_id) in {left_id, right_id} and model.geom_contype[geom_id] != 0:
+                finger_geoms.append(
+                    {
+                        "body": model.body(int(body_id)).name,
+                        "pos": np.round(data.geom_xpos[geom_id], 4).tolist(),
+                        "size": np.round(model.geom_size[geom_id], 4).tolist(),
+                    }
+                )
+        finger_joint_positions = np.round(
+            [data.qpos[model.jnt_qposadr[model.joint("finger_joint1").id]], data.qpos[model.jnt_qposadr[model.joint("finger_joint2").id]]], 5
+        ).tolist()
+        all_contacts = [
+            f"{model.geom(contact.geom1).name}/{model.geom(contact.geom2).name}"
+            for contact in data.contact[: data.ncon]
+        ]
+        raise RuntimeError(
+            f"夹爪在 {timeout_s:.1f}s 内未与 {object_name} 形成双侧真实接触；"
+            f"要求的 CAD 碰撞面={list(required_object_geometries)}；"
+            f"object={np.round(data.xpos[object_id], 4).tolist()}，finger_geoms={finger_geoms}"
+            f"，finger_qpos={finger_joint_positions}，all_contacts={all_contacts}"
+        )
+
     def attach(
         self,
         object_name: str,
         expected_closing_axis_base: np.ndarray | None = None,
         opposing_contact_pair_object: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
+        required_object_geometries: tuple[str, ...] = (),
     ) -> None:
         """仅在双侧真实接触、轴对齐且（CAD 路径中）落在相对面后确认物理夹持。"""
         if object_name not in self.graspable_object_names:
@@ -293,8 +350,12 @@ class MujocoTaskExecutor:
         object_rotation = data.xmat[object_id].reshape(3, 3)
         left_contact_points_object: list[np.ndarray] = []
         right_contact_points_object: list[np.ndarray] = []
+        contact_geometry_names: list[str] = []
         for index in range(data.ncon):
             contact = data.contact[index]
+            contact_names = {model.geom(contact.geom1).name, model.geom(contact.geom2).name}
+            if required_object_geometries and not contact_names.intersection(required_object_geometries):
+                continue
             body_a, body_b = model.geom_bodyid[contact.geom1], model.geom_bodyid[contact.geom2]
             bodies = {int(body_a), int(body_b)}
             if object_id not in bodies:
@@ -303,12 +364,27 @@ class MujocoTaskExecutor:
             if left_id in bodies:
                 left_contact += 1
                 left_contact_points_object.append(point_object)
+                contact_geometry_names.append("/".join(sorted(contact_names)))
             if right_id in bodies:
                 right_contact += 1
                 right_contact_points_object.append(point_object)
+                contact_geometry_names.append("/".join(sorted(contact_names)))
         if left_contact == 0 or right_contact == 0:
+            hand_position = np.round(data.xpos[hand_id], 4).tolist()
+            object_position = np.round(data.xpos[object_id], 4).tolist()
+            left_position = np.round(data.xpos[left_id], 4).tolist()
+            right_position = np.round(data.xpos[right_id], 4).tolist()
+            finger_joint_positions = np.round(
+                [data.qpos[model.jnt_qposadr[model.joint("finger_joint1").id]], data.qpos[model.jnt_qposadr[model.joint("finger_joint2").id]]], 4
+            ).tolist()
+            contact_names = [
+                f"{model.geom(contact.geom1).name}/{model.geom(contact.geom2).name}"
+                for contact in data.contact[: data.ncon]
+            ]
             raise RuntimeError(
-                f"夹爪未形成双侧真实接触：left={left_contact}，right={right_contact}；拒绝伪附着"
+                f"夹爪未形成双侧真实接触：left={left_contact}，right={right_contact}；拒绝伪附着；"
+                f"hand={hand_position}，object={object_position}，left_finger={left_position}，right_finger={right_position}，"
+                f"finger_qpos={finger_joint_positions}，all_contacts={contact_names}"
             )
         matched_opposing_faces = "not_checked"
         if opposing_contact_pair_object is not None:
@@ -317,8 +393,9 @@ class MujocoTaskExecutor:
             )
 
             def touches_surface(points: list[np.ndarray], center: np.ndarray, normal: np.ndarray) -> bool:
-                # 接触点位于指尖与物体的交界处；0.015 m 同时覆盖 pad 厚度和求解器软接触误差。
-                return any(abs(float(np.dot(point - center, normal))) <= 0.015 for point in points)
+                # 仅允许落在 CAD 标注面附近 3 mm；此前 15 mm 容差会把同一侧
+                # 把手接触误判为两侧接触，无法保证真正的左右对称夹握。
+                return any(abs(float(np.dot(point - center, normal))) <= 0.003 for point in points)
 
             left_positive = touches_surface(left_contact_points_object, positive_center, positive_normal)
             left_negative = touches_surface(left_contact_points_object, negative_center, negative_normal)
@@ -356,6 +433,12 @@ class MujocoTaskExecutor:
             "grasp_attached", object_id=object_name, method="physical_fingertip_contact_and_weld",
             left_contacts=float(left_contact), right_contacts=float(right_contact), closing_axis_alignment=alignment,
             opposing_contact_pair=matched_opposing_faces,
+            required_object_geometries=list(required_object_geometries),
+            verified_contact_geometries=sorted(set(contact_geometry_names)),
+            # 记录到 CAD 局部系，便于离线直接核验接触是否分别位于把手两面，
+            # 而不是只依赖 VNC 画面观感。
+            left_contact_points_object=np.round(left_contact_points_object, 6).tolist(),
+            right_contact_points_object=np.round(right_contact_points_object, 6).tolist(),
         )
 
     def release_physical(self, settle_s: float = 0.75) -> PhysicalReleaseSummary:

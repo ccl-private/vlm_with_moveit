@@ -13,9 +13,9 @@ from .unified_scene import UnifiedPandaCupSimulation
 def _pixel_count(rgb: np.ndarray, color: str) -> int:
     red, green, blue = rgb[..., 0], rgb[..., 1], rgb[..., 2]
     selectors = {
-        "red_cup": (red > 120) & (green < 100) & (blue < 100),
-        "green_cup": (green > 100) & (green > red * 1.3) & (green > blue * 1.15),
-        "blue_cup": (blue > 105) & (blue > red * 1.25) & (blue > green * 1.15),
+        "red_cylinder": (red > 120) & (green < 100) & (blue < 100),
+        "green_cylinder": (green > 100) & (green > red * 1.3) & (green > blue * 1.15),
+        "blue_cylinder": (blue > 105) & (blue > red * 1.25) & (blue > green * 1.15),
     }
     return int(selectors[color].sum())
 
@@ -27,7 +27,7 @@ def main() -> None:
         frames = simulation.cameras()
         fixed = frames["fixed"]
         snapshot = simulation.synchronization_snapshot()
-        visible_pixels = {name: _pixel_count(fixed.rgb, name) for name in ("red_cup", "green_cup", "blue_cup")}
+        visible_pixels = {name: _pixel_count(fixed.rgb, name) for name in ("red_cylinder", "green_cylinder", "blue_cylinder")}
         if any(count < 40 for count in visible_pixels.values()):
             raise RuntimeError(f"固定相机未清楚看到全部杯子：{visible_pixels}")
         if fixed.rgb.shape != (480, 640, 3) or fixed.depth.shape != (480, 640):

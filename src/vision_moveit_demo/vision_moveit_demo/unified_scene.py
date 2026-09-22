@@ -42,7 +42,7 @@ class UnifiedPandaCupSimulation:
 
     def __init__(self, root: Path, width: int = 640, height: int = 480, create_renderers: bool = True) -> None:
         self.root = root
-        scene = root / "assets" / "panda_mjcf" / "unified_panda_cup_scene.xml"
+        scene = root / "assets" / "panda_mjcf" / "unified_panda_objects_scene.xml"
         self.model = mujoco.MjModel.from_xml_path(str(scene))
         self.data = mujoco.MjData(self.model)
         self.width, self.height = width, height
@@ -66,11 +66,14 @@ class UnifiedPandaCupSimulation:
         # Panda 的官方 keyframe 只定义了机械臂关节；场景后来加入的 freejoint
         # 必须在这里显式复位，否则会继承为零位姿，导致杯子落到世界原点。
         graspable_object_poses = {
-            "red_cup_freejoint": ((0.48, -0.16, 0.465), (1.0, 0.0, 0.0, 0.0)),
-            "green_cup_freejoint": ((0.34, 0.06, 0.465), (1.0, 0.0, 0.0, 0.0)),
-            "blue_cup_freejoint": ((0.30, -0.24, 0.465), (1.0, 0.0, 0.0, 0.0)),
+            "red_cylinder_freejoint": ((0.78, -0.25, 0.465), (1.0, 0.0, 0.0, 0.0)),
+            "green_cylinder_freejoint": ((0.34, 0.06, 0.465), (1.0, 0.0, 0.0, 0.0)),
+            "blue_cylinder_freejoint": ((0.30, -0.24, 0.465), (1.0, 0.0, 0.0, 0.0)),
             "purple_cube_freejoint": ((0.35, -0.08, 0.43), (1.0, 0.0, 0.0, 0.0)),
             "magenta_block_freejoint": ((0.45, -0.32, 0.425), (0.962425, 0.0, 0.0, 0.271547)),
+            # MuJoCo freejoint 四元数为 w,x,y,z；绕 Z 180° 让把手面向相机/作业侧。
+            # 该姿态不作为感知真值输入。
+            "yellow_mug_freejoint": ((0.45, -0.12, 0.575), (0.0, 0.0, 0.0, 1.0)),
         }
         for joint_name, (position, quaternion) in graspable_object_poses.items():
             joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
@@ -161,7 +164,7 @@ class UnifiedPandaCupSimulation:
             for name in joint_names
         }
         objects: dict[str, dict[str, np.ndarray]] = {}
-        for object_name in ("red_cup", "green_cup", "blue_cup", "purple_cube", "magenta_block", "tray"):
+        for object_name in ("red_cylinder", "green_cylinder", "blue_cylinder", "purple_cube", "magenta_block", "yellow_mug", "mug_pedestal", "tray_pedestal", "tray"):
             body_id = self.model.body(object_name).id
             world_from_object = np.eye(4)
             world_from_object[:3, :3] = self.data.xmat[body_id].reshape(3, 3)

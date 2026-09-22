@@ -63,7 +63,35 @@ def main() -> None:
         fixed_frame = simulation.cameras()["fixed"]
         segmentation = ColorThresholdSegmenter().segment(fixed_frame.rgb, intent)
         pose = CadMatcherDispatcher().match(model, segmentation, fixed_frame)
-        candidates = grasp_pose_candidates(pose, model.grasp_templates)
+        templates = tuple(
+            template for template in model.grasp_templates
+            if intent.grasp_region is None or template.grasp_region == intent.grasp_region
+        )
+        if not templates:
+            raise RuntimeError(f"CAD 模型没有与语义抓取区域匹配的抓取框：{intent.grasp_region}")
+        candidates = grasp_pose_candidates(pose, templates)
+        # 横向把手抓取框（手腕绕工具 Z 旋转 90°）下，MoveIt ``panda_hand``
+        # 参考点相对 MuJoCo 指尖工作点低约 82 mm，故目标参考点须向上补偿。
+        # 该外参来自闭爪前记录的真实 pad 位姿，避免把手上方/下方的伪接触。
+        # CAD 标注与接触判定始终使用真实指尖工作点坐标系。
+        moveit_tcp_offset_m = np.array([0.0, 0.0, 0.082])
+        print(
+            "[视觉 CAD 配准] "
+            f"目标={target_object_id}，实例像素={segmentation.pixel_count}，"
+            f"物体位置=({pose.position_base_m[0]:.4f}, {pose.position_base_m[1]:.4f}, {pose.position_base_m[2]:.4f})，"
+            f"yaw={pose.object_yaw_rad!r}，方法={pose.matching_method}",
+            flush=True,
+        )
+        for candidate_template, candidate_position, candidate_orientation in candidates:
+            print(
+                "[CAD 抓取候选] "
+                f"标注={candidate_template.template_id}，"
+                f"抓取位=({candidate_position[0]:.4f}, {candidate_position[1]:.4f}, {candidate_position[2]:.4f})，"
+                f"四元数_xyzw=({candidate_orientation[0]:.4f}, {candidate_orientation[1]:.4f}, "
+                f"{candidate_orientation[2]:.4f}, {candidate_orientation[3]:.4f})，"
+                f"预抓取净空={candidate_template.approach_clearance_m:.3f}m",
+                flush=True,
+            )
         # 正常档以仿真时间一倍速运行；VNC 只显示该节拍，不通过渲染 sleep 改变它。
         executor = MujocoTaskExecutor(simulation, frame_callback=render_frame, realtime_factor=1.0)
         executor.set_display_state(f"CAD match complete: {target_object_id} / {model.model_id}")
@@ -72,7 +100,23 @@ def main() -> None:
         try:
             # 当前工装位置来自对象目录；目标杯位置仅来自本次 CAD 配准。
             time.sleep(3.0)
-            client.publish_scene_positions(catalog.fixture_collision_positions(), grasp_target=target_object_id)
+            # 抓取时手掌需贴近杯子下方的支撑平台；平台在 MuJoCo 中始终真实存在，
+            # MoveIt 仅在建立目标夹持前临时排除它，避免把“可抓目标+其支撑面”误判为目标位碰撞。
+            client.publish_scene_positions(
+                catalog.fixture_collision_positions(),
+                # 预抓取路径必须把目标杯也作为障碍；否则 OMPL 会为节省距离
+                # 直接横穿杯身，MuJoCo 中就会在闭爪前把杯子撞偏。
+                grasp_target=None,
+                # 当前 Panda home 与 URDF 简化碰撞盒会和近旁绿色圆柱/托盘支撑台
+                # 产生假接触；二者在 MuJoCo 物理场景中仍保留，MoveIt 仅在本回合
+                # 规划时临时排除，避免启动状态被错误拒绝。
+                # 简化场景中的 tray 是实心盒，既覆盖托盘内腔，也会在当前近端
+                # 工装位置与 home 手部相交；它不能用于本任务的放置碰撞判定。
+                # 实际托盘碰撞与最终“是否落入盘内”仍由 MuJoCo 完整几何负责。
+                temporary_exclusions=("mug_pedestal", "tray_pedestal", "tray", "green_cylinder")
+                if target_object_id == "yellow_mug"
+                else (),
+            )
             time.sleep(1.0)
             motion_wall_start = time.monotonic()
             executor.set_gripper(opened=True)
@@ -80,11 +124,22 @@ def main() -> None:
             rejected_candidates: list[dict[str, str]] = []
             for candidate_template, candidate_position, candidate_orientation in candidates:
                 pregrasp = candidate_position + np.array([0.0, 0.0, candidate_template.approach_clearance_m])
+                # 横向对称夹取的最终中心相对安全通道向 -X 偏 5 mm。先到无偏移
+                # 的高位（已验证可达），再在目标上方横移，避免 OMPL 在带杯身
+                # 碰撞体时拒绝最终抓取中心的整段预抓取路径。
+                safe_pregrasp = pregrasp + np.array([0.005, 0.0, 0.0])
+                moveit_pregrasp = safe_pregrasp + moveit_tcp_offset_m
                 executor.set_display_state(f"CAD candidate / MoveIt: {candidate_template.template_id}")
                 client.publish_joint_state(executor.joint_positions())
+                # ROS 2 话题是异步的。必须让规划桥先消费当前 MuJoCo 关节快照，
+                # 否则 VNC 实时渲染下可能按上一阶段状态反复规划，出现“轨迹成功但手没移动”。
+                time.sleep(0.25)
                 try:
-                    pregrasp_trajectory = client.request(pregrasp, candidate_orientation)
+                    pregrasp_trajectory = client.request(
+                        moveit_pregrasp, candidate_orientation
+                    )
                 except TimeoutError as error:
+                    print(f"[MoveIt 预抓取失败] 标注={candidate_template.template_id}；原因={error}", flush=True)
                     rejected_candidates.append({"frame_id": candidate_template.template_id, "reason": str(error)})
                     continue
                 selected = (candidate_template, candidate_position, candidate_orientation, pregrasp_trajectory)
@@ -92,20 +147,46 @@ def main() -> None:
             if selected is None:
                 raise RuntimeError(f"MoveIt 未找到可执行的 CAD 抓取标注候选：{rejected_candidates}")
             template, grasp_position, grasp_orientation, pregrasp_trajectory = selected
-            placement = catalog.physical_placement_targets(model, template)
+            moveit_grasp_position = grasp_position + moveit_tcp_offset_m
+            placement = catalog.physical_placement_targets(
+                model, template, pose.transform_base_object[:3, :3]
+            )
             tray_center = placement.tray_center_base_m
             targets = [
-                ("approach", grasp_position),
-                ("lift", grasp_position + np.array([0.0, 0.0, template.lift_clearance_m])),
-                ("place_above", placement.gripper_above_base_m),
-                ("place_descend", placement.gripper_release_base_m),
+                ("approach", moveit_grasp_position),
+                ("lift", grasp_position + np.array([0.0, 0.0, template.lift_clearance_m]) + moveit_tcp_offset_m),
+                ("place_above", placement.gripper_above_base_m + moveit_tcp_offset_m),
+                ("place_descend", placement.gripper_release_base_m + moveit_tcp_offset_m),
             ]
             executor.set_display_state("CAD grasp / MoveIt: pregrasp")
             _execute_trajectory(executor, pregrasp_trajectory)
             executor._event("moveit_pregrasp_complete")
             executor.set_display_state("CAD grasp / MoveIt: approach")
+            if target_object_id == "yellow_mug":
+                # 结束场景静置约束；从此处开始杯子只受真实接触动力学与夹持约束影响。
+                simulation.data.eq_active[simulation.model.equality("yellow_mug_rest").id] = 0
+                import mujoco
+                mujoco.mj_forward(simulation.model, simulation.data)
+                print("[场景静置] 已解除 yellow_mug_rest，开始真实物理接近", flush=True)
+            # 已到达上方安全位后才移除目标碰撞盒，让末段接近能够建立真实把手接触。
+            client.publish_scene_positions(
+                catalog.fixture_collision_positions(),
+                grasp_target=target_object_id,
+                temporary_exclusions=("mug_pedestal", "tray_pedestal", "tray", "green_cylinder")
+                if target_object_id == "yellow_mug"
+                else (),
+            )
+            time.sleep(0.5)
             client.publish_joint_state(executor.joint_positions())
-            _execute_trajectory(executor, client.request(grasp_position, grasp_orientation))
+            time.sleep(0.25)
+            try:
+                _execute_trajectory(
+                    executor,
+                    client.request(moveit_grasp_position, grasp_orientation),
+                )
+            except TimeoutError as error:
+                print(f"[MoveIt 抓取位失败] 标注={template.template_id}；原因={error}", flush=True)
+                raise
             executor._event(
                 "moveit_approach_complete",
                 hand_x=float(executor.body_position("hand")[0]),
@@ -115,8 +196,25 @@ def main() -> None:
                 object_y=float(executor.body_position(target_object_id)[1]),
                 object_z=float(executor.body_position(target_object_id)[2]),
             )
+            preclose_fingers = []
+            for geom_id, body_id in enumerate(simulation.model.geom_bodyid):
+                if int(body_id) in {simulation.model.body("left_finger").id, simulation.model.body("right_finger").id} and simulation.model.geom_contype[geom_id] != 0:
+                    preclose_fingers.append({
+                        "body": simulation.model.body(int(body_id)).name,
+                        "position": np.round(simulation.data.geom_xpos[geom_id], 4).tolist(),
+                    })
+            print(
+                "[抓取前物理状态] "
+                f"object={np.round(executor.body_position(target_object_id), 4).tolist()}，"
+                f"finger_qpos={[round(float(simulation.data.qpos[simulation.model.jnt_qposadr[simulation.model.joint(name).id]]), 5) for name in ('finger_joint1', 'finger_joint2')]}，"
+                f"finger_geoms={preclose_fingers}",
+                flush=True,
+            )
             executor.set_display_state("Gripper: close and stable attach CAD target")
-            executor.set_gripper(opened=False)
+            executor.close_until_dual_contact(
+                target_object_id,
+                required_object_geometries=template.contact_collision_geometries,
+            )
             closing_axis_base = pose.transform_base_object[:3, :3] @ template.jaw_closing_axis_object
             pair = template.opposing_contact_pair
             executor.attach(
@@ -128,11 +226,20 @@ def main() -> None:
                     pair.negative_surface.center_object_m,
                     pair.negative_surface.normal_object,
                 ),
+                required_object_geometries=template.contact_collision_geometries,
             )
             for stage, target in targets[1:]:
                 executor.set_display_state(f"CAD grasp / MoveIt: {stage} with {target_object_id}")
                 client.publish_joint_state(executor.joint_positions())
-                _execute_trajectory(executor, client.request(target, grasp_orientation))
+                time.sleep(0.25)
+                try:
+                    _execute_trajectory(
+                        executor,
+                        client.request(target, grasp_orientation),
+                    )
+                except TimeoutError as error:
+                    print(f"[MoveIt 阶段失败] 阶段={stage}；原因={error}", flush=True)
+                    raise
                 executor._event(
                     f"moveit_{stage}_complete",
                     hand_x=float(executor.body_position("hand")[0]),
@@ -164,12 +271,14 @@ def main() -> None:
                     "mesh": str(model.mesh_path.relative_to(arguments.root)),
                     "symmetry": model.symmetry_type,
                     "selected_grasp_template": template.template_id,
+                    "selected_grasp_region": template.grasp_region,
                 },
                 "pose_estimate": pose.as_dict(),
                 "grasp_position_base_m": grasp_position.tolist(),
                 "grasp_orientation_base_xyzw": grasp_orientation.tolist(),
                 "grasp_annotation": {
                     "frame_id": template.template_id,
+                    "grasp_region": template.grasp_region,
                     "contact_regions": list(template.contact_regions),
                     "jaw_closing_axis_object": template.jaw_closing_axis_object.tolist(),
                     "opposing_contact_pair": {

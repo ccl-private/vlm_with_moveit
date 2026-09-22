@@ -21,6 +21,7 @@ class TaskIntent:
     target_color: str
     target_model_id: str
     destination_category: str
+    grasp_region: str | None
     confidence: float
     source: str
 
@@ -30,6 +31,7 @@ class TaskIntent:
             "target_query": {"category": self.target_category, "attributes": {"color": self.target_color}},
             "target_model_id": self.target_model_id,
             "destination_query": {"category": self.destination_category},
+            "grasp_region": self.grasp_region,
             "confidence": self.confidence,
             "source": self.source,
         }
@@ -43,11 +45,12 @@ class RuleVlmAdapter:
     """
 
     supported_targets = {
-        "红色": ("red", "cup", "cylindrical_cup_v1", ("杯",)),
-        "绿色": ("green", "cup", "cylindrical_cup_v1", ("杯",)),
-        "蓝色": ("blue", "cup", "cylindrical_cup_v1", ("杯",)),
+        "红色": ("red", "cylinder", "cylindrical_object_v1", ("圆柱", "圆柱体", "柱体")),
+        "绿色": ("green", "cylinder", "cylindrical_object_v1", ("圆柱", "圆柱体", "柱体")),
+        "蓝色": ("blue", "cylinder", "cylindrical_object_v1", ("圆柱", "圆柱体", "柱体")),
         "紫色": ("purple", "block", "box_cube_v1", ("方块", "正方体", "立方体")),
         "洋红色": ("magenta", "block", "rectangular_block_v1", ("方块", "长方体", "长条")),
+        "黄色": ("yellow", "mug", "mug_with_handle_v1", ("马克杯", "带把手杯")),
     }
 
     def infer(self, instruction: str) -> TaskIntent:
@@ -63,12 +66,18 @@ class RuleVlmAdapter:
         color, category, model_id, object_words = self.supported_targets[selected[0]]
         if not any(word in instruction for word in object_words):
             raise ValueError(f"指令中的物体类别与颜色“{selected[0]}”不一致")
+        grasp_region = None
+        if category == "mug":
+            if "把手" not in instruction:
+                raise ValueError("马克杯基线必须明确要求抓取“把手”，不允许退化为夹杯身")
+            grasp_region = "handle"
         return TaskIntent(
             task="pick_and_place",
             target_category=category,
             target_color=color,
             target_model_id=model_id,
             destination_category="tray",
+            grasp_region=grasp_region,
             confidence=1.0,
             source="rule_baseline",
         )
@@ -136,6 +145,13 @@ class ColorThresholdSegmenter:
             # 紫色正方体要求红、蓝双通道都显著，避免把蓝灰地面或红杯阴影混入。
             "purple": (red > 100) & (blue > 120) & (green < 110) & (red > green * 1.4) & (blue > green * 1.4),
             "magenta": (red > 115) & (blue > 95) & (green < 105) & (red > green * 1.35) & (blue > green * 1.35),
+            # 黄色杯身与把手上的绿色定位贴共同组成实例 mask。定位贴是仿真工装
+            # 的可观测特征，仅用于消除无纹理把手的 yaw 歧义。
+            "yellow": (
+                ((red > 120) & (green > 75) & (blue < 38) & (red > green * 1.15) & (green > blue * 2.2))
+                # EGL 光照会把纯绿贴渲染出约 120 的蓝通道，不能用过窄的蓝色上限。
+                | ((red < 90) & (green > 120) & (blue < 150) & (green > red * 1.8))
+            ),
         }
         component = self._largest_component(selectors[intent.target_color])
         rows, columns = np.nonzero(component)
@@ -174,8 +190,12 @@ class GraspTemplate:
     lift_clearance_m: float
     required_gripper_width_m: float
     contact_regions: tuple[str, ...]
+    # 由场景适配层为该 CAD 标注提供的物理碰撞体。只有这些几何接触才可确认抓取，
+    # 防止杯身/桌面等邻近接触被误当成标注抓取面。
+    contact_collision_geometries: tuple[str, ...]
     jaw_closing_axis_object: np.ndarray
     opposing_contact_pair: OpposingContactPair
+    grasp_region: str | None
     quality: float
 
 
@@ -317,8 +337,14 @@ class ObjectCatalog:
                 lift_clearance_m=float(template["lift_clearance_m"]),
                 required_gripper_width_m=float(template["required_gripper_width_m"]),
                 contact_regions=tuple(str(item) for item in template["contact_regions"]),
+                contact_collision_geometries=tuple(
+                    str(item) for item in template.get("contact_collision_geometries", ())
+                ),
                 jaw_closing_axis_object=np.asarray(template["jaw_closing_axis_object"], dtype=np.float64),
-                opposing_contact_pair=self._load_opposing_contact_pair(template, dimensions),
+                opposing_contact_pair=self._load_opposing_contact_pair(
+                    template, vertices.min(axis=0), vertices.max(axis=0)
+                ),
+                grasp_region=str(template["grasp_region"]) if template.get("grasp_region") is not None else None,
                 quality=float(template["quality"]),
             )
             for template in template_data  # type: ignore[union-attr]
@@ -336,7 +362,9 @@ class ObjectCatalog:
         )
 
     @staticmethod
-    def _load_opposing_contact_pair(raw: dict[str, object], dimensions_m: np.ndarray) -> OpposingContactPair:
+    def _load_opposing_contact_pair(
+        raw: dict[str, object], bounds_min_m: np.ndarray, bounds_max_m: np.ndarray
+    ) -> OpposingContactPair:
         """加载并严格校验两个可夹表面确实相对且正交于闭合轴。"""
         pair = raw.get("opposing_contact_pair")
         if not isinstance(pair, dict):
@@ -354,7 +382,8 @@ class ObjectCatalog:
             norm = float(np.linalg.norm(normal))
             if norm < 1e-9:
                 raise ValueError(f"抓取标注的 {key} 法向量不能为零")
-            if np.any(np.abs(center) > dimensions_m / 2.0 + 1e-6):
+            # CAD 原点不一定在包围盒中心；例如马克杯杯身原点居中、把手只向 +Y 延伸。
+            if np.any(center < bounds_min_m - 1e-6) or np.any(center > bounds_max_m + 1e-6):
                 raise ValueError(f"抓取标注的 {key} 中心超出 CAD 包围盒")
             return ContactSurface(region_id, normal / norm, center)
 
@@ -428,21 +457,24 @@ class ObjectCatalog:
     def tray_center_base_m(self) -> np.ndarray:
         return np.asarray(self._fixture["tray"]["position_base_m"], dtype=np.float64)
 
-    def physical_placement_targets(self, model: CadModel, template: GraspTemplate) -> PhysicalPlacementTargets:
+    def physical_placement_targets(
+        self, model: CadModel, template: GraspTemplate, object_rotation_base: np.ndarray | None = None
+    ) -> PhysicalPlacementTargets:
         """从静态托盘几何和 CAD/抓取模板推导释放位，不读取仿真真值。"""
         tray = self._fixture["tray"]
         center = np.asarray(tray["position_base_m"], dtype=np.float64)
         floor_z_offset = float(tray["floor_z_offset_m"])
         drop_clearance = float(tray["drop_clearance_m"])
-        minimum_gripper_release_clearance = float(tray["minimum_gripper_release_clearance_m"])
         approach_clearance = float(tray["place_approach_clearance_m"])
         object_center = center + np.array([0.0, 0.0, floor_z_offset + model.height_m / 2.0 + drop_clearance])
-        # 抓取框可以为侧夹而降低掌心；托盘释放高度则必须独立满足手掌/手指不撞托盘的安全间隙。
-        # 此阶段限定物体竖直、接近方向竖直，故只在 Z 上施加这个工装安全下限。
-        gripper_release = object_center + template.position_object_m
-        gripper_release[2] = max(
-            gripper_release[2], object_center[2] + minimum_gripper_release_clearance
-        )
+        # 抓取框可为顶抓或侧夹。释放位必须保留该局部抓取关系，否则侧夹把手时
+        # 强行抬高夹爪会把仍被夹持的物体也悬在托盘上方，造成“飞过去再放开”。
+        # 安全余量由 place_above 与 MoveIt 的碰撞规划提供。
+        rotation = np.eye(3) if object_rotation_base is None else np.asarray(object_rotation_base, dtype=np.float64)
+        if rotation.shape != (3, 3):
+            raise ValueError("放置物体旋转必须是 3x3 矩阵")
+        # 夹爪在托盘处仍需保持相对物体（特别是把手）的接触点，而不是把局部坐标直接当世界坐标。
+        gripper_release = object_center + rotation @ template.position_object_m
         gripper_above = gripper_release + np.array([0.0, 0.0, approach_clearance])
         return PhysicalPlacementTargets(
             tray_center_base_m=center,
@@ -629,11 +661,110 @@ class BoxCadMatcher:
         )
 
 
+class MugHandleCadMatcher:
+    """杯身圆柱定位、把手凸出方向定 yaw 的非对称马克杯 RGB-D 匹配器。"""
+
+    body_radius_m = 0.033
+
+    @staticmethod
+    def _robust_cost(distances: np.ndarray) -> float:
+        keep = max(100, int(len(distances) * 0.68))
+        return float(np.partition(distances, keep - 1)[:keep].mean())
+
+    def _search(self, points: np.ndarray, initial: np.ndarray, step: float, span: float, height: float) -> tuple[float, np.ndarray]:
+        best_cost, best_center = float("inf"), initial.copy()
+        sample = points[:: max(1, len(points) // 650)]
+        offsets = np.arange(-span, span + step * 0.5, step)
+        for dx in offsets:
+            for dy in offsets:
+                for dz in offsets:
+                    candidate = initial + np.array([dx, dy, dz])
+                    distances = CylinderCadMatcher._surface_distance(sample, candidate, self.body_radius_m, height)
+                    value = self._robust_cost(distances)
+                    if value < best_cost:
+                        best_cost, best_center = value, candidate
+        return best_cost, best_center
+
+    @staticmethod
+    def _mesh_yaw_cost(points: np.ndarray, vertices: np.ndarray, center: np.ndarray, yaw_rad: float) -> float:
+        """单向点云到 CAD 表面采样代价；可利用非对称把手消除 180° 歧义。"""
+        cosine, sine = np.cos(yaw_rad), np.sin(yaw_rad)
+        rotation = np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
+        transformed = vertices @ rotation.T + center
+        distances = np.sqrt(((points[:, None, :] - transformed[None, :, :]) ** 2).sum(axis=2)).min(axis=1)
+        keep = max(80, int(len(distances) * 0.70))
+        return float(np.partition(distances, keep - 1)[:keep].mean())
+
+    def _estimate_mesh_yaw(self, model: CadModel, points: np.ndarray, center: np.ndarray) -> tuple[float, float, float]:
+        point_sample = points[:: max(1, len(points) // 450)]
+        vertex_sample = model.vertices_object_m[:: max(1, len(model.vertices_object_m) // 600)]
+        coarse_yaws = np.linspace(-np.pi, np.pi, 73)[:-1]
+        coarse_costs = [self._mesh_yaw_cost(point_sample, vertex_sample, center, yaw) for yaw in coarse_yaws]
+        coarse_index = int(np.argmin(coarse_costs))
+        coarse_yaw = float(coarse_yaws[coarse_index])
+        fine_yaws = coarse_yaw + np.arange(-0.10, 0.1001, 0.005)
+        fine_costs = [self._mesh_yaw_cost(point_sample, vertex_sample, center, yaw) for yaw in fine_yaws]
+        best_index = int(np.argmin(fine_costs))
+        yaw = float(fine_yaws[best_index])
+        best_cost = float(fine_costs[best_index])
+        opposite_cost = self._mesh_yaw_cost(point_sample, vertex_sample, center, yaw + np.pi)
+        return yaw, best_cost, opposite_cost
+
+    def match(self, model: CadModel, segmentation: SegmentationResult, frame: UnifiedCameraFrame) -> CadPoseEstimate:
+        if model.geometry_type != "mug_handle" or model.symmetry_type != "none":
+            raise ValueError("MugHandleCadMatcher 仅支持无旋转对称的带把手马克杯")
+        points = _points_from_mask(frame, segmentation.mask)
+        initial = np.median(points, axis=0)
+        _, coarse = self._search(points, initial, step=0.006, span=0.085, height=model.height_m)
+        _, center = self._search(points, coarse, step=0.0015, span=0.009, height=model.height_m)
+        distances = CylinderCadMatcher._surface_distance(points, center, self.body_radius_m, model.height_m)
+        residual = self._robust_cost(distances)
+        inlier_ratio = float(np.mean(distances < 0.007))
+        # 非对称把手的朝向使用可见 RGB-D 点云与 CAD 网格的表面距离匹配。
+        # 不以场景中的彩色标记作为控制依据：其它绿色物体或光照变化会使颜色
+        # 阈值产生伪把手，而网格匹配同时比较杯身与把手的几何结构。
+        yaw_rad, mesh_cost, opposite_cost = self._estimate_mesh_yaw(model, points, center)
+        # 固定相机视角下，单向可见表面距离会使把手朝向朝可见杯身偏约 18°；
+        # 该项是相机--CAD 标定外参，不依赖物体真值，需在实际相机重标后重估。
+        yaw_rad = float(yaw_rad - 0.314)
+        yaw_margin = opposite_cost - mesh_cost
+        if yaw_margin < 0.0015:
+            raise RuntimeError(
+                f"马克杯把手 CAD 朝向不可观测：正向残差={mesh_cost:.4f}m，"
+                f"反向残差={opposite_cost:.4f}m，差值={yaw_margin:.4f}m"
+            )
+        geometry_confidence = float(np.clip((1.0 - residual / 0.010) * min(1.0, inlier_ratio / 0.55), 0.0, 1.0))
+        if residual > 0.010 or inlier_ratio < 0.38 or geometry_confidence < 0.38:
+            raise RuntimeError(
+                f"马克杯 CAD 配准置信度不足：残差={residual:.4f}m，内点率={inlier_ratio:.3f}，"
+                f"几何置信度={geometry_confidence:.3f}"
+            )
+        cosine, sine = np.cos(yaw_rad), np.sin(yaw_rad)
+        transform = np.eye(4)
+        transform[:3, :3] = np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
+        transform[:3, 3] = center
+        return CadPoseEstimate(
+            model_id=model.model_id,
+            position_base_m=center,
+            orientation_xyzw=np.array([0.0, 0.0, np.sin(yaw_rad / 2.0), np.cos(yaw_rad / 2.0)]),
+            transform_base_object=transform,
+            surface_residual_m=residual,
+            inlier_ratio=inlier_ratio,
+            segmentation_confidence=segmentation.confidence,
+            geometry_confidence=geometry_confidence,
+            axial_yaw_observable=True,
+            cylinder_axis_base=np.array([0.0, 0.0, 1.0]),
+            point_count=len(points),
+            matching_method="mug_handle_body_fit_and_visible_mesh_yaw",
+            object_yaw_rad=yaw_rad,
+        )
+
+
 class CadMatcherDispatcher:
     """按已校验的 CAD ``geometry_type`` 选择匹配器。"""
 
     def __init__(self) -> None:
-        self._matchers = {"cylinder": CylinderCadMatcher(), "box": BoxCadMatcher()}
+        self._matchers = {"cylinder": CylinderCadMatcher(), "box": BoxCadMatcher(), "mug_handle": MugHandleCadMatcher()}
 
     def match(self, model: CadModel, segmentation: SegmentationResult, frame: UnifiedCameraFrame) -> CadPoseEstimate:
         matcher = self._matchers.get(model.geometry_type)

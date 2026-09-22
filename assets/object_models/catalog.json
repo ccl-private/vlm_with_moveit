@@ -1,12 +1,12 @@
 {
   "geometry_models": [
     {
-      "model_id": "cylindrical_cup_v1",
+      "model_id": "cylindrical_object_v1",
       "geometry_type": "cylinder",
-      "mesh": "red_cylindrical_cup_v1.obj",
+      "mesh": "cylindrical_object_v1.obj",
       "units": "m",
       "symmetry": {"type": "axial", "axis_object": [0.0, 0.0, 1.0]},
-      "grasp_annotation": "red_cylindrical_cup_v1.grasp.json"
+      "grasp_annotation": "cylindrical_object_v1.grasp.json"
     },
     {
       "model_id": "box_cube_v1",
@@ -23,30 +23,42 @@
       "units": "m",
       "symmetry": {"type": "discrete_z_2", "axis_object": [0.0, 0.0, 1.0]},
       "grasp_annotation": "orange_rectangular_block_v1.grasp.json"
+    },
+    {
+      "model_id": "mug_with_handle_v1",
+      "geometry_type": "mug_handle",
+      "mesh": "mug_with_handle_v1.obj",
+      "units": "m",
+      "symmetry": {"type": "none", "axis_object": [0.0, 0.0, 1.0]},
+      "grasp_annotation": "mug_with_handle_v1.grasp.json"
     }
   ],
   "instances": [
-    {"scene_object_id": "red_cup", "category": "cup", "attributes": {"color": "red"}, "geometry_model_id": "cylindrical_cup_v1"},
-    {"scene_object_id": "green_cup", "category": "cup", "attributes": {"color": "green"}, "geometry_model_id": "cylindrical_cup_v1"},
-    {"scene_object_id": "blue_cup", "category": "cup", "attributes": {"color": "blue"}, "geometry_model_id": "cylindrical_cup_v1"},
+    {"scene_object_id": "red_cylinder", "category": "cylinder", "attributes": {"color": "red"}, "geometry_model_id": "cylindrical_object_v1"},
+    {"scene_object_id": "green_cylinder", "category": "cylinder", "attributes": {"color": "green"}, "geometry_model_id": "cylindrical_object_v1"},
+    {"scene_object_id": "blue_cylinder", "category": "cylinder", "attributes": {"color": "blue"}, "geometry_model_id": "cylindrical_object_v1"},
     {"scene_object_id": "purple_cube", "category": "block", "attributes": {"color": "purple"}, "geometry_model_id": "box_cube_v1"}
     ,{"scene_object_id": "magenta_block", "category": "block", "attributes": {"color": "magenta"}, "geometry_model_id": "rectangular_block_v1"}
+    ,{"scene_object_id": "yellow_mug", "category": "mug", "attributes": {"color": "yellow"}, "geometry_model_id": "mug_with_handle_v1"}
   ],
   "static_fixture": {
     "table": {"position_base_m": [0.725, 0.0, 0.36], "box_dimensions_m": [0.85, 0.96, 0.07]},
     "tray": {
-      "position_base_m": [0.52, 0.25, 0.45],
+      "position_base_m": [0.48, 0.18, 0.537],
       "box_dimensions_m": [0.26, 0.22, 0.094],
       "floor_z_offset_m": 0.012,
       "drop_clearance_m": 0.012,
       "minimum_gripper_release_clearance_m": 0.135,
-      "place_approach_clearance_m": 0.106,
+      "place_approach_clearance_m": 0.075,
       "inner_drop_half_extents_m": [0.08, 0.075]
     },
-    "red_cup": {"position_base_m": [0.48, -0.16, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
-    "green_cup": {"position_base_m": [0.34, 0.06, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
-    "blue_cup": {"position_base_m": [0.30, -0.24, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
+    "red_cylinder": {"position_base_m": [0.78, -0.25, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
+    "green_cylinder": {"position_base_m": [0.34, 0.06, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
+    "blue_cylinder": {"position_base_m": [0.30, -0.24, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
     "purple_cube": {"position_base_m": [0.35, -0.08, 0.43], "box_dimensions_m": [0.07, 0.07, 0.07]}
     ,"magenta_block": {"position_base_m": [0.45, -0.32, 0.425], "box_dimensions_m": [0.14, 0.055, 0.06]}
+    ,"yellow_mug": {"position_base_m": [0.45, -0.12, 0.575], "mesh_dimensions_m": [0.082, 0.121633, 0.10], "handle_direction_object": [0.0, 1.0, 0.0]}
+    ,"mug_pedestal": {"position_base_m": [0.45, -0.12, 0.485], "box_dimensions_m": [0.28, 0.24, 0.08]}
+    ,"tray_pedestal": {"position_base_m": [0.48, 0.18, 0.485], "box_dimensions_m": [0.36, 0.30, 0.08]}
   }
 }
