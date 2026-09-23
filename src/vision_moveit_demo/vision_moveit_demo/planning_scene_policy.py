@@ -28,7 +28,7 @@ class TaskPlanningScenePolicy:
     destination_object: str = "tray"
     phase: PlanningPhase = PlanningPhase.PREGRASP
     compatibility_exclusions: frozenset[str] = frozenset(
-        {"green_cylinder", "mug_pedestal", "tray_pedestal"}
+        {"green_cylinder"}
     )
 
     def world_exclusions(self) -> frozenset[str]:

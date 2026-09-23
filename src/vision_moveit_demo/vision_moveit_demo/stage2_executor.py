@@ -481,6 +481,15 @@ class MujocoTaskExecutor:
     def object_in_tray(self, object_name: str, tray_center_base: np.ndarray) -> bool:
         position = self.simulation.evaluation_only_truth(object_name)
         delta = np.abs(position[:2] - np.asarray(tray_center_base)[:2])
-        inside = bool(delta[0] < 0.095 and delta[1] < 0.075 and position[2] > 0.45)
+        # 托盘已直接落在桌面：其底板上表面是中心 z 加 12 mm。旧的固定
+        # ``z > 0.45`` 只适用于垫高托盘，会把底面刚好落在托盘内的长方体
+        # （中心约 z=0.449）误报为失败。
+        tray_floor_z = float(np.asarray(tray_center_base)[2] + 0.012)
+        inside = bool(
+            delta[0] < 0.095
+            and delta[1] < 0.075
+            and position[2] >= tray_floor_z + 0.005
+            and position[2] <= tray_floor_z + 0.13
+        )
         self._event("tray_verification", object_id=object_name, result="passed" if inside else "failed")
         return inside

@@ -44,7 +44,7 @@
   "static_fixture": {
     "table": {"position_base_m": [0.725, 0.0, 0.36], "box_dimensions_m": [0.85, 0.96, 0.07]},
     "tray": {
-      "position_base_m": [0.48, 0.18, 0.537],
+      "position_base_m": [0.48, 0.18, 0.407],
       "box_dimensions_m": [0.26, 0.22, 0.094],
       "floor_z_offset_m": 0.012,
       "drop_clearance_m": 0.012,
@@ -52,13 +52,11 @@
       "place_approach_clearance_m": 0.075,
       "inner_drop_half_extents_m": [0.08, 0.075]
     },
-    "red_cylinder": {"position_base_m": [0.78, -0.25, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
-    "green_cylinder": {"position_base_m": [0.34, 0.06, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
+    "red_cylinder": {"position_base_m": [0.30, 0.30, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
+    "green_cylinder": {"position_base_m": [0.22, 0.08, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
     "blue_cylinder": {"position_base_m": [0.30, -0.24, 0.465], "cylinder_height_m": 0.14, "cylinder_radius_m": 0.038},
     "purple_cube": {"position_base_m": [0.35, -0.08, 0.43], "box_dimensions_m": [0.07, 0.07, 0.07]}
-    ,"magenta_block": {"position_base_m": [0.45, -0.32, 0.425], "box_dimensions_m": [0.14, 0.055, 0.06]}
-    ,"yellow_mug": {"position_base_m": [0.45, -0.12, 0.575], "mesh_dimensions_m": [0.082, 0.121633, 0.10], "handle_direction_object": [0.0, 1.0, 0.0]}
-    ,"mug_pedestal": {"position_base_m": [0.45, -0.12, 0.485], "box_dimensions_m": [0.28, 0.24, 0.08]}
-    ,"tray_pedestal": {"position_base_m": [0.48, 0.18, 0.485], "box_dimensions_m": [0.36, 0.30, 0.08]}
+    ,"magenta_block": {"position_base_m": [0.42, -0.28, 0.425], "box_dimensions_m": [0.14, 0.055, 0.06]}
+    ,"yellow_mug": {"position_base_m": [0.45, -0.12, 0.445], "mesh_dimensions_m": [0.082, 0.121633, 0.10], "handle_direction_object": [0.0, 1.0, 0.0]}
   }
 }

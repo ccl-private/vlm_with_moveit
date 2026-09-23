@@ -22,9 +22,6 @@
     <material name="cube_purple" rgba="0.60 0.08 0.78 1"/>
     <material name="block_magenta" rgba="0.88 0.05 0.72 1"/>
     <material name="mug_yellow" rgba="0.92 0.62 0.06 1" emission="0.35"/>
-    <!-- 高饱和绿色是把手独有的视觉特征；与托盘的蓝青色区分，供 RGB-D 估计 yaw。 -->
-    <material name="mug_handle_marker" rgba="0.02 0.95 0.02 1" emission="0.60"/>
-    <material name="fixture_pedestal" rgba="0.24 0.31 0.38 1"/>
     <!-- panda.xml 设置了 meshdir=assets，故此路径相对 panda_mjcf/assets 解析。 -->
     <mesh name="mug_handle_visual_mesh" file="../../object_models/mug_with_handle_v1.obj"/>
   </asset>
@@ -42,11 +39,12 @@
       <geom name="table_leg_right_back" type="box" pos="-0.43 0.36 -0.32" size="0.04 0.04 0.32" material="table_top"/>
     </body>
 
-    <body name="red_cylinder" pos="0.78 -0.25 0.465">
+    <body name="red_cylinder" pos="0.30 0.30 0.465">
       <freejoint name="red_cylinder_freejoint"/>
       <geom name="red_cylinder_geom" type="cylinder" size="0.038 0.07" material="cylinder_red" mass="0.12" friction="1.2 0.01 0.001"/>
     </body>
-    <body name="green_cylinder" pos="0.34 0.06 0.465">
+    <!-- 与桌面托盘外缘保留净空，避免托盘落桌后在初始物理步挤压该圆柱。 -->
+    <body name="green_cylinder" pos="0.22 0.08 0.465">
       <freejoint name="green_cylinder_freejoint"/>
       <geom name="green_cylinder_geom" type="cylinder" size="0.038 0.07" material="cylinder_green" mass="0.12" friction="1.2 0.01 0.001"/>
     </body>
@@ -59,37 +57,29 @@
       <freejoint name="purple_cube_freejoint"/>
       <geom name="purple_cube_geom" type="box" size="0.035 0.035 0.035" material="cube_purple" mass="0.12" friction="1.2 0.01 0.001"/>
     </body>
-    <!-- 位于固定相机前景，避免被杯子遮挡，同时保持 Panda 抬升可达。 -->
-    <body name="magenta_block" pos="0.45 -0.32 0.425" quat="0.962425 0 0 0.271547">
+    <!-- 位于固定相机前景，避免被杯子遮挡，并留在 0.55 m 工作空间半径内。 -->
+    <body name="magenta_block" pos="0.42 -0.28 0.425" quat="0.962425 0 0 0.271547">
       <freejoint name="magenta_block_freejoint"/>
       <geom name="magenta_block_geom" type="box" size="0.070 0.0275 0.030" material="block_magenta" mass="0.12" friction="1.2 0.01 0.001"/>
     </body>
-    <!-- 大长方体工装将把手抓取高度抬离桌面，避免末端/桌面干涉。 -->
-    <body name="mug_pedestal" pos="0.45 -0.12 0.485">
-      <geom name="mug_pedestal_geom" type="box" size="0.14 0.12 0.04" material="fixture_pedestal" friction="5.0 0.01 0.001" solref="0.002 1" solimp="0.98 0.99 0.0001"/>
-    </body>
-    <!-- 杯体以 MuJoCo 的 w,x,y,z 四元数绕 Z 旋转 180°，把手朝固定相机/机械臂一侧；绿色定位贴贴在把手外表面，
-         只供视觉消除 180° 歧义，不参与碰撞。 -->
-    <body name="yellow_mug" pos="0.45 -0.12 0.575" quat="0 0 0 1">
+    <!-- 杯体以 MuJoCo 的 w,x,y,z 四元数绕 Z 旋转 180°，把手朝固定相机/机械臂一侧。
+         杯身半高为 50 mm，故中心 z=0.445，
+         其碰撞底面恰好落在桌面上表面 z=0.395。 -->
+    <body name="yellow_mug" pos="0.45 -0.12 0.445" quat="0 0 0 1">
       <freejoint name="yellow_mug_freejoint"/>
       <geom name="yellow_mug_visual" type="mesh" mesh="mug_handle_visual_mesh" material="mug_yellow" contype="0" conaffinity="0" group="2"/>
-      <!-- 标定片与网格外表面留出间隔，避免被杯把手视觉网格遮住；不参与物理。 -->
-      <geom name="yellow_mug_handle_visual_marker" type="box" pos="0 0.095 0" size="0.011 0.003 0.022" material="mug_handle_marker" contype="0" conaffinity="0" group="0"/>
       <!-- 杯身和把手分开采用稳定的凸碰撞近似；外侧竖杆采用平面接触块，
            与 CAD 标注的 +Y/-Y 成对夹持面一致，防止薄圆杆在单指初触时滚出夹爪。 -->
       <!-- 碰撞几何与视觉网格同为杯身 ±50 mm、把手外竖条 y=68…80 mm。
            接触边界外扩 1 mm：在视觉网格相交前开始受力，且保持原有稳定求解。 -->
-      <geom name="yellow_mug_body_collision" type="cylinder" size="0.033 0.050" mass="0.50" friction="5.0 0.01 0.001" margin="0.001"/>
+      <geom name="yellow_mug_body_collision" type="cylinder" size="0.033 0.050" mass="0.50" friction="5.0 0.01 0.001" margin="0.001" solref="0.002 1" solimp="0.98 0.99 0.0001"/>
       <geom name="yellow_mug_handle_outer_collision" type="box" pos="0 0.074 0" size="0.006 0.006 0.028" mass="0.001" friction="1.2 0.01 0.001" margin="0.001"/>
       <geom name="yellow_mug_handle_upper_collision" type="capsule" fromto="0 0.033 0.034 0 0.074 0.028" size="0.006" mass="0.001" friction="1.2 0.01 0.001" margin="0.001"/>
       <geom name="yellow_mug_handle_lower_collision" type="capsule" fromto="0 0.033 -0.034 0 0.074 -0.028" size="0.006" mass="0.001" friction="1.2 0.01 0.001" margin="0.001"/>
     </body>
 
-    <!-- 托盘也由独立大长方体垫高；放置路径不再贴近桌面。 -->
-    <body name="tray_pedestal" pos="0.48 0.18 0.485">
-      <geom name="tray_pedestal_geom" type="box" size="0.18 0.15 0.04" material="fixture_pedestal" solref="0.002 1" solimp="0.98 0.99 0.0001"/>
-    </body>
-    <body name="tray" pos="0.48 0.18 0.537">
+    <!-- 托盘底板半厚为 12 mm，中心 z=0.407，使底板直接置于桌面 z=0.395。 -->
+    <body name="tray" pos="0.48 0.18 0.407">
       <geom name="tray_base" type="box" size="0.13 0.11 0.012" material="tray_material"/>
       <geom name="tray_front" type="box" pos="0 -0.10 0.035" size="0.13 0.012 0.035" material="tray_material"/>
       <geom name="tray_back" type="box" pos="0 0.10 0.035" size="0.13 0.012 0.035" material="tray_material"/>
@@ -114,9 +104,8 @@
     <weld name="grasp_yellow_mug" body1="hand" body2="yellow_mug" active="false" solref="0.05 1" solimp="0.90 0.98 0.001"/>
     <!-- 仅用于视觉与预抓取规划期间锁住长方体；最终接近前解除，避免目标在重力下漂移。 -->
     <weld name="magenta_block_rest" body1="table" body2="magenta_block" active="true" solref="0.01 1" solimp="0.95 0.99 0.0001"/>
-    <!-- 仅用于场景静置：视觉帧、MoveIt 预抓取规划期间锁住杯子，避免工装
-         边界的微小接触将自由杯体缓慢挤离初始观测位；接近前立即解除。 -->
-    <weld name="yellow_mug_rest" body1="mug_pedestal" body2="yellow_mug" active="true" solref="0.01 1" solimp="0.95 0.99 0.0001"/>
+    <!-- 仅用于场景静置：视觉帧、MoveIt 预抓取规划期间锁住桌面上的杯子；接近前立即解除。 -->
+    <weld name="yellow_mug_rest" body1="table" body2="yellow_mug" active="true" solref="0.01 1" solimp="0.95 0.99 0.0001"/>
   </equality>
 
 </mujoco>

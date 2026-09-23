@@ -66,8 +66,6 @@ class MoveItTrajectoryClient(Node):
             # 预抓取阶段只需阻止路径横穿杯身。用实际杯身圆柱而非包住把手
             # 与空腔的实心大盒，避免在把手上方的合法预抓取位被误判为碰撞。
             "yellow_mug": (SolidPrimitive.CYLINDER, [0.10, 0.033]),
-            "mug_pedestal": (SolidPrimitive.BOX, [0.28, 0.24, 0.08]),
-            "tray_pedestal": (SolidPrimitive.BOX, [0.36, 0.30, 0.08]),
         }
         # 任务脚本每回合启动独立的规划服务。这里直接省略目标和临时排除件即可；
         # 不能对一个尚不存在的 CollisionObject 发 REMOVE，否则 MoveIt 会拒绝

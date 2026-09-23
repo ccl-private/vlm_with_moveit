@@ -182,8 +182,7 @@ def main() -> None:
         try:
             # 当前工装位置来自对象目录；目标杯位置仅来自本次 CAD 配准。
             time.sleep(3.0)
-            # 抓取时手掌需贴近杯子下方的支撑平台；平台在 MuJoCo 中始终真实存在，
-            # MoveIt 仅在建立目标夹持前临时排除它，避免把“可抓目标+其支撑面”误判为目标位碰撞。
+            # 所有目标都直接位于桌面；预抓取阶段保留桌面与其它物体的碰撞约束。
             client.publish_task_scene(
                 catalog.fixture_collision_positions(), target_object_id, PlanningPhase.PREGRASP
             )
@@ -293,9 +292,7 @@ def main() -> None:
                         target_object_id,
                         required_object_geometries=template.contact_collision_geometries,
                     )
-                    closing_axis_base = None if target_object_id == "magenta_block" else (
-                        pose.transform_base_object[:3, :3] @ template.jaw_closing_axis_object
-                    )
+                    closing_axis_base = pose.transform_base_object[:3, :3] @ template.jaw_closing_axis_object
                     pair = template.opposing_contact_pair
                     executor.attach(
                         target_object_id,

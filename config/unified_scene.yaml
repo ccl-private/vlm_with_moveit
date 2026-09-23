@@ -14,8 +14,6 @@ objects:
   green_cylinder: {body: green_cylinder, geom: green_cylinder_geom}
   blue_cylinder: {body: blue_cylinder, geom: blue_cylinder_geom}
   yellow_mug: {body: yellow_mug, geom: yellow_mug_body_collision}
-  mug_pedestal: {body: mug_pedestal, geom: mug_pedestal_geom}
-  tray_pedestal: {body: tray_pedestal, geom: tray_pedestal_geom}
   purple_cube: {body: purple_cube, geom: purple_cube_geom}
   magenta_block: {body: magenta_block, geom: magenta_block_geom}
   tray: {body: tray, drop_site: tray_drop_zone}

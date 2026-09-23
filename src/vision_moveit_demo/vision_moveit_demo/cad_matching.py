@@ -145,13 +145,10 @@ class ColorThresholdSegmenter:
             # 紫色正方体要求红、蓝双通道都显著，避免把蓝灰地面或红杯阴影混入。
             "purple": (red > 100) & (blue > 120) & (green < 110) & (red > green * 1.4) & (blue > green * 1.4),
             "magenta": (red > 115) & (blue > 95) & (green < 105) & (red > green * 1.35) & (blue > green * 1.35),
-            # 黄色杯身与把手上的绿色定位贴共同组成实例 mask。定位贴是仿真工装
-            # 的可观测特征，仅用于消除无纹理把手的 yaw 歧义。
-            "yellow": (
-                ((red > 120) & (green > 75) & (blue < 38) & (red > green * 1.15) & (green > blue * 2.2))
-                # EGL 光照会把纯绿贴渲染出约 120 的蓝通道，不能用过窄的蓝色上限。
-                | ((red < 90) & (green > 120) & (blue < 150) & (green > red * 1.8))
-            ),
+            # 只取黄色杯子网格（杯身和把手），不把独立的绿色圆柱混入。绿色定位贴
+            # 的确有助于调试，但它与绿色圆柱颜色相同；用“最大连通域”合并两者会
+            # 令离相机更近的绿色圆柱被误识别为马克杯。
+            "yellow": (red > 120) & (green > 75) & (blue < 38) & (red > green * 1.15) & (green > blue * 2.2),
         }
         component = self._largest_component(selectors[intent.target_color])
         rows, columns = np.nonzero(component)
@@ -776,9 +773,9 @@ class CadMatcherDispatcher:
 def grasp_pose_from_template(pose: CadPoseEstimate, template: GraspTemplate) -> tuple[np.ndarray, np.ndarray]:
     """将对象标注抓取框变换为 MoveIt ``panda_hand`` 目标。
 
-    标注的朝向以 MuJoCo 指尖 pad 实际夹持坐标系表达；Panda 的 MoveIt
-    ``panda_hand`` 与该 body 固定相差绕 Z 轴 45°，故在此统一施加 TCP
-    外参，不能分散写入每个 CAD 的抓取标注。
+    CAD 标注使用 MuJoCo 指尖的夹合坐标系。实际 ``hand`` 的闭合轴相对 MoveIt
+    ``panda_hand`` 目标反向偏 45°，故目标须施加正向 45° 补偿。该符号已通过
+    真实 MuJoCo 双指接触的轴对齐检查验证。
     """
     rotation = pose.transform_base_object[:3, :3]
     position = pose.position_base_m + rotation @ template.position_object_m
@@ -791,7 +788,8 @@ def grasp_pose_from_template(pose: CadPoseEstimate, template: GraspTemplate) -> 
         ow * tw - ox * tx - oy * ty - oz * tz,
     ])
     orientation /= np.linalg.norm(orientation)
-    # q_target = q_pad_grasp * q_z(+45°)，xyzw 格式。
+    # q_target = q_pad_grasp * q_z(+45°)，xyzw 格式。补偿后 MuJoCo 中实际
+    # 手爪的 Y 轴（闭合轴）与 CAD 标注的相对夹持面法向平行。
     tcp_offset = np.array([0.0, 0.0, np.sin(np.pi / 8.0), np.cos(np.pi / 8.0)])
     ox, oy, oz, ow = orientation
     tx, ty, tz, tw = tcp_offset
