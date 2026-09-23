@@ -4,7 +4,10 @@ set -euo pipefail
 # 一键启动：CAD 3D 模型匹配、MoveIt 规划与 MuJoCo/VNC 抓取执行。
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root_dir"
-ros_domain_id="${MOVEIT_ROS_DOMAIN_ID:-76}"
+# 同一 ROS domain 中的两个 MoveIt bridge 会争用同一个 move_group action，
+# 导致客户端收到其它回合的 goal/result 并超时。未显式指定时为本次回合分配
+# 独立 domain；需要复现或接入外部 ROS 工具时仍可设置 MOVEIT_ROS_DOMAIN_ID。
+ros_domain_id="${MOVEIT_ROS_DOMAIN_ID:-$((RANDOM % 200 + 20))}"
 log_dir="${root_dir}/logs/stage3_cad_vnc"
 mkdir -p "$log_dir"
 

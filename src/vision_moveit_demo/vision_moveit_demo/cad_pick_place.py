@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
+from geometry_msgs.msg import Pose
 
 from .cad_matching import (
     ColorThresholdSegmenter,
@@ -24,6 +25,7 @@ from .cad_matching import (
 from .stage2_executor import MujocoTaskExecutor
 from .truth_baseline import MoveItTrajectoryClient, _execute_trajectory
 from .unified_scene import UnifiedPandaCupSimulation
+from .planning_scene_policy import PlanningPhase
 
 
 def _write_pgm(path: Path, mask: np.ndarray) -> None:
@@ -31,6 +33,71 @@ def _write_pgm(path: Path, mask: np.ndarray) -> None:
     with path.open("wb") as output:
         output.write(f"P5\n{image.shape[1]} {image.shape[0]}\n255\n".encode())
         output.write(image.tobytes())
+
+
+def _quaternion_to_matrix(quaternion_xyzw: np.ndarray) -> np.ndarray:
+    x, y, z, w = quaternion_xyzw
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ]
+    )
+
+
+def _matrix_to_quaternion(rotation: np.ndarray) -> np.ndarray:
+    trace = float(np.trace(rotation))
+    if trace > 0.0:
+        scale = 2.0 * np.sqrt(trace + 1.0)
+        w = 0.25 * scale
+        x = (rotation[2, 1] - rotation[1, 2]) / scale
+        y = (rotation[0, 2] - rotation[2, 0]) / scale
+        z = (rotation[1, 0] - rotation[0, 1]) / scale
+    else:
+        diagonal = np.diag(rotation)
+        index = int(np.argmax(diagonal))
+        if index == 0:
+            scale = 2.0 * np.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2])
+            x = 0.25 * scale
+            y = (rotation[0, 1] + rotation[1, 0]) / scale
+            z = (rotation[0, 2] + rotation[2, 0]) / scale
+            w = (rotation[2, 1] - rotation[1, 2]) / scale
+        elif index == 1:
+            scale = 2.0 * np.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2])
+            x = (rotation[0, 1] + rotation[1, 0]) / scale
+            y = 0.25 * scale
+            z = (rotation[1, 2] + rotation[2, 1]) / scale
+            w = (rotation[0, 2] - rotation[2, 0]) / scale
+        else:
+            scale = 2.0 * np.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1])
+            x = (rotation[0, 2] + rotation[2, 0]) / scale
+            y = (rotation[1, 2] + rotation[2, 1]) / scale
+            z = 0.25 * scale
+            w = (rotation[1, 0] - rotation[0, 1]) / scale
+    return np.array([x, y, z, w]) / np.linalg.norm([x, y, z, w])
+
+
+def _rotate_vector_by_quaternion(vector: np.ndarray, quaternion_xyzw: np.ndarray) -> np.ndarray:
+    rotation = _quaternion_to_matrix(quaternion_xyzw)
+    return rotation @ vector
+
+
+def _attached_pose_in_hand(
+    object_position_base: np.ndarray,
+    object_rotation_base: np.ndarray,
+    hand_position_base: np.ndarray,
+    hand_orientation_xyzw: np.ndarray,
+) -> Pose:
+    hand_rotation = _quaternion_to_matrix(hand_orientation_xyzw)
+    relative_rotation = hand_rotation.T @ object_rotation_base
+    relative_position = hand_rotation.T @ (object_position_base - hand_position_base)
+    pose = Pose()
+    pose.position.x, pose.position.y, pose.position.z = map(float, relative_position)
+    pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = map(
+        float, _matrix_to_quaternion(relative_rotation)
+    )
+    return pose
 
 
 def main() -> None:
@@ -85,7 +152,6 @@ def main() -> None:
         # 参考点相对 MuJoCo 指尖工作点低约 82 mm，故目标参考点须向上补偿。
         # 该外参来自闭爪前记录的真实 pad 位姿，避免把手上方/下方的伪接触。
         # CAD 标注与接触判定始终使用真实指尖工作点坐标系。
-        moveit_tcp_offset_m = np.array([0.0, 0.0, 0.082])
         print(
             "[视觉 CAD 配准] "
             f"目标={target_object_id}，实例像素={segmentation.pixel_count}，"
@@ -118,20 +184,8 @@ def main() -> None:
             time.sleep(3.0)
             # 抓取时手掌需贴近杯子下方的支撑平台；平台在 MuJoCo 中始终真实存在，
             # MoveIt 仅在建立目标夹持前临时排除它，避免把“可抓目标+其支撑面”误判为目标位碰撞。
-            client.publish_scene_positions(
-                catalog.fixture_collision_positions(),
-                # 预抓取路径必须把目标杯也作为障碍；否则 OMPL 会为节省距离
-                # 直接横穿杯身，MuJoCo 中就会在闭爪前把杯子撞偏。
-                grasp_target=None,
-                # 当前 Panda home 与 URDF 简化碰撞盒会和近旁绿色圆柱/托盘支撑台
-                # 产生假接触；二者在 MuJoCo 物理场景中仍保留，MoveIt 仅在本回合
-                # 规划时临时排除，避免启动状态被错误拒绝。
-                # 简化场景中的 tray 是实心盒，既覆盖托盘内腔，也会在当前近端
-                # 工装位置与 home 手部相交；它不能用于本任务的放置碰撞判定。
-                # 实际托盘碰撞与最终“是否落入盘内”仍由 MuJoCo 完整几何负责。
-                temporary_exclusions=("mug_pedestal", "tray_pedestal", "tray", "green_cylinder")
-                if target_object_id == "yellow_mug"
-                else (),
+            client.publish_task_scene(
+                catalog.fixture_collision_positions(), target_object_id, PlanningPhase.PREGRASP
             )
             time.sleep(1.0)
             motion_wall_start = time.monotonic()
@@ -144,7 +198,10 @@ def main() -> None:
                 # 的高位（已验证可达），再在目标上方横移，避免 OMPL 在带杯身
                 # 碰撞体时拒绝最终抓取中心的整段预抓取路径。
                 safe_pregrasp = pregrasp + np.array([0.005, 0.0, 0.0])
-                moveit_pregrasp = safe_pregrasp + moveit_tcp_offset_m
+                tcp_offset = _rotate_vector_by_quaternion(
+                    np.array([0.0, 0.0, -0.082]), candidate_orientation
+                )
+                moveit_pregrasp = safe_pregrasp + tcp_offset
                 executor.set_display_state(f"CAD candidate / MoveIt: {candidate_template.template_id}")
                 client.publish_joint_state(executor.joint_positions())
                 # ROS 2 话题是异步的。必须让规划桥先消费当前 MuJoCo 关节快照，
@@ -163,16 +220,19 @@ def main() -> None:
             if selected is None:
                 raise RuntimeError(f"MoveIt 未找到可执行的 CAD 抓取标注候选：{rejected_candidates}")
             template, grasp_position, grasp_orientation, pregrasp_trajectory = selected
-            moveit_grasp_position = grasp_position + moveit_tcp_offset_m
+            tcp_offset = _rotate_vector_by_quaternion(
+                np.array([0.0, 0.0, -0.082]), grasp_orientation
+            )
+            moveit_grasp_position = grasp_position + tcp_offset
             placement = catalog.physical_placement_targets(
                 model, template, pose.transform_base_object[:3, :3]
             )
             tray_center = placement.tray_center_base_m
             targets = [
                 ("approach", moveit_grasp_position),
-                ("lift", grasp_position + np.array([0.0, 0.0, template.lift_clearance_m]) + moveit_tcp_offset_m),
-                ("place_above", placement.gripper_above_base_m + moveit_tcp_offset_m),
-                ("place_descend", placement.gripper_release_base_m + moveit_tcp_offset_m),
+                ("lift", grasp_position + np.array([0.0, 0.0, template.lift_clearance_m]) + tcp_offset),
+                ("place_above", placement.gripper_above_base_m + tcp_offset),
+                ("place_descend", placement.gripper_release_base_m + tcp_offset),
             ]
             executor.set_display_state("CAD grasp / MoveIt: pregrasp")
             _execute_trajectory(executor, pregrasp_trajectory)
@@ -185,73 +245,106 @@ def main() -> None:
                 mujoco.mj_forward(simulation.model, simulation.data)
                 print("[场景静置] 已解除 yellow_mug_rest，开始真实物理接近", flush=True)
             # 已到达上方安全位后才移除目标碰撞盒，让末段接近能够建立真实把手接触。
-            client.publish_scene_positions(
-                catalog.fixture_collision_positions(),
-                grasp_target=target_object_id,
-                temporary_exclusions=("mug_pedestal", "tray_pedestal", "tray", "green_cylinder")
-                if target_object_id == "yellow_mug"
-                else (),
+            client.publish_task_scene(
+                catalog.fixture_collision_positions(), target_object_id, PlanningPhase.APPROACH
             )
-            time.sleep(0.5)
-            client.publish_joint_state(executor.joint_positions())
-            time.sleep(0.25)
-            try:
-                _execute_trajectory(
-                    executor,
-                    client.request(moveit_grasp_position, grasp_orientation),
-                )
-            except TimeoutError as error:
-                print(f"[MoveIt 抓取位失败] 标注={template.template_id}；原因={error}", flush=True)
-                raise
-            executor._event(
-                "moveit_approach_complete",
-                hand_x=float(executor.body_position("hand")[0]),
-                hand_y=float(executor.body_position("hand")[1]),
-                hand_z=float(executor.body_position("hand")[2]),
-                object_x=float(executor.body_position(target_object_id)[0]),
-                object_y=float(executor.body_position(target_object_id)[1]),
-                object_z=float(executor.body_position(target_object_id)[2]),
-            )
-            preclose_fingers = []
-            for geom_id, body_id in enumerate(simulation.model.geom_bodyid):
-                if int(body_id) in {simulation.model.body("left_finger").id, simulation.model.body("right_finger").id} and simulation.model.geom_contype[geom_id] != 0:
-                    preclose_fingers.append({
-                        "body": simulation.model.body(int(body_id)).name,
-                        "position": np.round(simulation.data.geom_xpos[geom_id], 4).tolist(),
-                    })
-            print(
-                "[抓取前物理状态] "
-                f"object={np.round(executor.body_position(target_object_id), 4).tolist()}，"
-                f"finger_qpos={[round(float(simulation.data.qpos[simulation.model.jnt_qposadr[simulation.model.joint(name).id]]), 5) for name in ('finger_joint1', 'finger_joint2')]}，"
-                f"finger_geoms={preclose_fingers}",
-                flush=True,
-            )
-            executor.set_display_state("Gripper: close and stable attach CAD target")
-            executor.close_until_dual_contact(
-                target_object_id,
-                required_object_geometries=template.contact_collision_geometries,
-            )
-            closing_axis_base = pose.transform_base_object[:3, :3] @ template.jaw_closing_axis_object
-            pair = template.opposing_contact_pair
-            executor.attach(
-                target_object_id,
-                closing_axis_base,
-                (
-                    pair.positive_surface.center_object_m,
-                    pair.positive_surface.normal_object,
-                    pair.negative_surface.center_object_m,
-                    pair.negative_surface.normal_object,
-                ),
-                required_object_geometries=template.contact_collision_geometries,
+            grasp_confirmed = False
+            for attempt in range(1, 13):
+                if attempt > 1:
+                    executor.set_gripper(opened=True)
+                    executor.set_display_state(f"CAD grasp retry {attempt}: pregrasp")
+                    client.publish_joint_state(executor.joint_positions())
+                    time.sleep(0.25)
+                    try:
+                        retry_pregrasp = client.request(
+                            moveit_pregrasp,
+                            candidate_orientation,
+                        )
+                        _execute_trajectory(executor, retry_pregrasp)
+                    except TimeoutError as error:
+                        print(f"[抓取重试] 第 {attempt} 次预抓取规划失败：{error}", flush=True)
+                        continue
+                    executor.set_display_state(f"CAD grasp retry {attempt}: approach")
+                time.sleep(0.5)
+                client.publish_joint_state(executor.joint_positions())
+                time.sleep(0.25)
+                try:
+                    # 抓取框定义了物体相对手爪的偏置。即使只要求末端位置到达，
+                    # 自由的腕部姿态也会旋转这段偏置，令长方体在托盘外侧松开；
+                    # 因此接近、抬升和放置全程保持 CAD 的完整抓取姿态。
+                    _execute_trajectory(
+                        executor,
+                        client.request(
+                            moveit_grasp_position,
+                            grasp_orientation,
+                        ),
+                    )
+                    executor._event(
+                        "moveit_approach_complete",
+                        hand_x=float(executor.body_position("hand")[0]),
+                        hand_y=float(executor.body_position("hand")[1]),
+                        hand_z=float(executor.body_position("hand")[2]),
+                        object_x=float(executor.body_position(target_object_id)[0]),
+                        object_y=float(executor.body_position(target_object_id)[1]),
+                        object_z=float(executor.body_position(target_object_id)[2]),
+                    )
+                    executor.set_display_state("Gripper: close and stable attach CAD target")
+                    executor.close_until_dual_contact(
+                        target_object_id,
+                        required_object_geometries=template.contact_collision_geometries,
+                    )
+                    closing_axis_base = None if target_object_id == "magenta_block" else (
+                        pose.transform_base_object[:3, :3] @ template.jaw_closing_axis_object
+                    )
+                    pair = template.opposing_contact_pair
+                    executor.attach(
+                        target_object_id,
+                        closing_axis_base,
+                        (
+                            pair.positive_surface.center_object_m,
+                            pair.positive_surface.normal_object,
+                            pair.negative_surface.center_object_m,
+                            pair.negative_surface.normal_object,
+                        ),
+                        required_object_geometries=template.contact_collision_geometries,
+                    )
+                    grasp_confirmed = True
+                    break
+                except (RuntimeError, TimeoutError) as error:
+                    if target_object_id != "magenta_block" or attempt == 12:
+                        raise
+                    print(f"[抓取重试] 第 {attempt} 次未形成双侧接触：{error}", flush=True)
+            if not grasp_confirmed:
+                raise RuntimeError("洋红色长方体在 12 次真实抓取重试后仍未形成双侧接触")
+            if target_object_id == "magenta_block":
+                simulation.data.eq_active[simulation.model.equality("magenta_block_rest").id] = 0
+                import mujoco
+                mujoco.mj_forward(simulation.model, simulation.data)
+                print("[场景静置] 已解除 magenta_block_rest，双侧接触已确认", flush=True)
+            attached_pose = _attached_pose_in_hand(
+                pose.position_base_m,
+                pose.transform_base_object[:3, :3],
+                moveit_grasp_position,
+                grasp_orientation,
             )
             for stage, target in targets[1:]:
                 executor.set_display_state(f"CAD grasp / MoveIt: {stage} with {target_object_id}")
+                phase = PlanningPhase.PLACE if stage.startswith("place") else PlanningPhase.TRANSPORT
+                client.publish_task_scene(
+                    catalog.fixture_collision_positions(),
+                    target_object_id,
+                    phase,
+                    attached_pose=attached_pose,
+                )
                 client.publish_joint_state(executor.joint_positions())
                 time.sleep(0.25)
                 try:
                     _execute_trajectory(
                         executor,
-                        client.request(target, grasp_orientation),
+                        client.request(
+                            target,
+                            grasp_orientation,
+                        ),
                     )
                 except TimeoutError as error:
                     print(f"[MoveIt 阶段失败] 阶段={stage}；原因={error}", flush=True)

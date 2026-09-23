@@ -5,6 +5,11 @@ root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${root_dir}/scripts/activate.sh"
 export MOVEIT_EXPERIMENT_ROOT="${root_dir}"
 export PYTHONPATH="${root_dir}/src/vision_moveit_demo${PYTHONPATH:+:${PYTHONPATH}}"
+# rclpy 默认写入 ~/.ros；在无 home 写权限的容器/VNC 启动器中会在初始化前失败。
+# 与 MoveIt 服务统一写到项目日志目录，且不影响调用方指定的外部路径。
+export ROS_LOG_DIR="${ROS_LOG_DIR:-${root_dir}/logs/ros}"
+export ROS_HOME="${ROS_HOME:-${root_dir}/logs/ros_home}"
+mkdir -p "${ROS_LOG_DIR}" "${ROS_HOME}"
 
 vnc_mode=0
 for argument in "$@"; do

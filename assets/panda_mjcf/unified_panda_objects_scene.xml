@@ -112,6 +112,8 @@
     <weld name="grasp_purple_cube" body1="hand" body2="purple_cube" active="false" solref="0.05 1" solimp="0.90 0.98 0.001"/>
     <weld name="grasp_magenta_block" body1="hand" body2="magenta_block" active="false" solref="0.05 1" solimp="0.90 0.98 0.001"/>
     <weld name="grasp_yellow_mug" body1="hand" body2="yellow_mug" active="false" solref="0.05 1" solimp="0.90 0.98 0.001"/>
+    <!-- 仅用于视觉与预抓取规划期间锁住长方体；最终接近前解除，避免目标在重力下漂移。 -->
+    <weld name="magenta_block_rest" body1="table" body2="magenta_block" active="true" solref="0.01 1" solimp="0.95 0.99 0.0001"/>
     <!-- 仅用于场景静置：视觉帧、MoveIt 预抓取规划期间锁住杯子，避免工装
          边界的微小接触将自由杯体缓慢挤离初始观测位；接近前立即解除。 -->
     <weld name="yellow_mug_rest" body1="mug_pedestal" body2="yellow_mug" active="true" solref="0.01 1" solimp="0.95 0.99 0.0001"/>

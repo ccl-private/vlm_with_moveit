@@ -3,9 +3,10 @@
   "model_id": "rectangular_block_v1",
   "grasp_frames": [{
     "frame_id": "top_down_long_side_v1",
-    "position_object_m": [0.0, 0.0, 0.105],
+    "position_object_m": [0.0, 0.0, 0.015],
     "orientation_object_xyzw": [1.0, 0.0, 0.0, 0.0],
     "contact_regions": ["long_side_positive_y", "long_side_negative_y"],
+    "contact_collision_geometries": ["magenta_block_geom"],
     "jaw_closing_axis_object": [0.0, 1.0, 0.0],
     "opposing_contact_pair": {
       "positive_surface": {

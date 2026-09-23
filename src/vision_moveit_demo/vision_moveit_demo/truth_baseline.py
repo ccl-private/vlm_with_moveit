@@ -10,13 +10,14 @@ from pathlib import Path
 import numpy as np
 import rclpy
 from geometry_msgs.msg import Pose, PoseStamped
-from moveit_msgs.msg import CollisionObject, PlanningScene, RobotTrajectory
+from moveit_msgs.msg import AttachedCollisionObject, CollisionObject, PlanningScene, RobotTrajectory
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 
 from .stage2_executor import MujocoTaskExecutor
 from .unified_scene import UnifiedPandaCupSimulation
+from .planning_scene_policy import PlanningPhase, TaskPlanningScenePolicy
 
 
 class MoveItTrajectoryClient(Node):
@@ -26,6 +27,8 @@ class MoveItTrajectoryClient(Node):
         self.scene_publisher = self.create_publisher(PlanningScene, "/vision_moveit/planning_scene_diff", 10)
         self.joint_publisher = self.create_publisher(JointState, "/vision_moveit/sim_joint_states", 10)
         self.trajectories: list[RobotTrajectory] = []
+        self._published_world_object_ids: set[str] = set()
+        self._published_attached_object_ids: set[str] = set()
         self.create_subscription(RobotTrajectory, "/vision_moveit/planned_trajectory", self.trajectories.append, 10)
 
     def publish_joint_state(self, positions: dict[str, float]) -> None:
@@ -45,6 +48,8 @@ class MoveItTrajectoryClient(Node):
         positions: dict[str, np.ndarray],
         grasp_target: str | None = None,
         temporary_exclusions: tuple[str, ...] = (),
+        attached_object: str | None = None,
+        attached_pose: Pose | None = None,
     ) -> None:
         """发布显式场景坐标；视觉闭环调用方不得传入 MuJoCo 真值快照。"""
         scene = PlanningScene(is_diff=True)
@@ -75,6 +80,24 @@ class MoveItTrajectoryClient(Node):
         for excluded_name in sorted(excluded):
             if excluded_name not in dimensions:
                 raise ValueError(f"未知的临时碰撞排除对象：{excluded_name}")
+        desired_world_names = set(dimensions) - excluded
+        desired_world_ids = {f"stage2_{name}" for name in desired_world_names}
+        for stale_id in sorted(self._published_world_object_ids - desired_world_ids):
+            object_message = CollisionObject()
+            object_message.id = stale_id
+            object_message.operation = CollisionObject.REMOVE
+            scene.world.collision_objects.append(object_message)
+        desired_attached_id = f"stage2_{attached_object}" if attached_object is not None else None
+        if desired_attached_id is None:
+            stale_attached_ids = self._published_attached_object_ids
+        else:
+            stale_attached_ids = self._published_attached_object_ids - {desired_attached_id}
+        for stale_id in sorted(stale_attached_ids):
+            attached = AttachedCollisionObject()
+            attached.link_name = "panda_hand"
+            attached.object.id = stale_id
+            attached.object.operation = CollisionObject.REMOVE
+            scene.robot_state.attached_collision_objects.append(attached)
         for name, (shape_type, shape_dimensions) in dimensions.items():
             # 接近阶段允许末端与目标杯建立接触；其它杯子、桌面和托盘仍进入碰撞场景。
             if name in excluded:
@@ -90,7 +113,44 @@ class MoveItTrajectoryClient(Node):
             object_message.primitive_poses = [pose]
             object_message.operation = CollisionObject.ADD
             scene.world.collision_objects.append(object_message)
+        if attached_object is not None:
+            if attached_object not in dimensions:
+                raise ValueError(f"未知的附着对象：{attached_object}")
+            if attached_pose is None:
+                raise ValueError("附着对象必须提供相对于 panda_hand 的位姿")
+            shape_type, shape_dimensions = dimensions[attached_object]
+            attached = CollisionObject()
+            attached.id = f"stage2_{attached_object}"
+            attached.header.frame_id = "panda_hand"
+            attached.primitives = [SolidPrimitive(type=shape_type, dimensions=shape_dimensions)]
+            attached.primitive_poses = [attached_pose]
+            attached.operation = CollisionObject.ADD
+            attached_message = AttachedCollisionObject()
+            attached_message.link_name = "panda_hand"
+            attached_message.object = attached
+            scene.robot_state.attached_collision_objects.append(attached_message)
         self.scene_publisher.publish(scene)
+        self._published_world_object_ids = desired_world_ids
+        self._published_attached_object_ids = (
+            {desired_attached_id} if desired_attached_id is not None else set()
+        )
+
+    def publish_task_scene(
+        self,
+        positions: dict[str, np.ndarray],
+        target_object: str,
+        phase: PlanningPhase,
+        attached_pose: Pose | None = None,
+    ) -> None:
+        """按任务目标和阶段发布碰撞场景，不由调用方手写颜色分支。"""
+        policy = TaskPlanningScenePolicy(target_object=target_object, phase=phase)
+        self.publish_scene_positions(
+            positions,
+            grasp_target=None,
+            temporary_exclusions=tuple(sorted(policy.world_exclusions())),
+            attached_object=policy.attached_object(),
+            attached_pose=attached_pose,
+        )
 
     def request(
         self,
