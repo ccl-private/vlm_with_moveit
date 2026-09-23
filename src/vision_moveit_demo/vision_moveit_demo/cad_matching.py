@@ -1,7 +1,7 @@
-"""阶段 3 的 CAD 模型匹配基线：规则语义、颜色分割、RGB-D 与圆柱 OBJ 表面配准。
+"""阶段 3 的 CAD 模型匹配：规则语义、颜色分割与 RGB-D 点云配准。
 
-本模块的控制路径不读取 ``evaluation_only_truth``。圆柱解析匹配只用于首个 OBJ
-基线；接口保留给后续通用网格的特征粗配准和 ICP 精配准实现。
+控制路径不读取 ``evaluation_only_truth``。圆柱、盒体和带把手马克杯保留各自的
+高可靠匹配器；``geometry_type=mesh`` 则使用桌面物体的通用 OBJ 网格兜底匹配。
 """
 from __future__ import annotations
 
@@ -145,9 +145,8 @@ class ColorThresholdSegmenter:
             # 紫色正方体要求红、蓝双通道都显著，避免把蓝灰地面或红杯阴影混入。
             "purple": (red > 100) & (blue > 120) & (green < 110) & (red > green * 1.4) & (blue > green * 1.4),
             "magenta": (red > 115) & (blue > 95) & (green < 105) & (red > green * 1.35) & (blue > green * 1.35),
-            # 只取黄色杯子网格（杯身和把手），不把独立的绿色圆柱混入。绿色定位贴
-            # 的确有助于调试，但它与绿色圆柱颜色相同；用“最大连通域”合并两者会
-            # 令离相机更近的绿色圆柱被误识别为马克杯。
+            # 只取黄色杯子网格（杯身和把手），不把独立的绿色圆柱混入。旧版绿色
+            # 定位贴已移除；仅依赖最大连通域会令离相机更近的绿色圆柱被误识别为马克杯。
             "yellow": (red > 120) & (green > 75) & (blue < 38) & (red > green * 1.15) & (green > blue * 2.2),
         }
         component = self._largest_component(selectors[intent.target_color])
@@ -202,6 +201,7 @@ class CadGeometry:
     geometry_type: str
     mesh_path: Path
     vertices_object_m: np.ndarray
+    triangles_object: np.ndarray
     dimensions_m: np.ndarray
     height_m: float
     symmetry_type: str
@@ -227,6 +227,7 @@ class CadModel:
     scene_object_id: str
     mesh_path: Path
     vertices_object_m: np.ndarray
+    triangles_object: np.ndarray
     dimensions_m: np.ndarray
     height_m: float
     symmetry_type: str
@@ -304,19 +305,38 @@ class ObjectCatalog:
             raise ValueError("对象目录的 geometry_models 中存在重复 model_id")
 
     @staticmethod
-    def _load_obj_vertices(path: Path) -> np.ndarray:
+    def _load_obj_mesh(path: Path) -> tuple[np.ndarray, np.ndarray]:
+        """读取 OBJ 顶点和三角面；通用兜底不接受没有表面的点云文件。"""
+        if path.suffix.lower() != ".obj":
+            raise ValueError(f"当前通用网格加载器仅支持 OBJ：{path}")
         vertices = []
+        triangles: list[tuple[int, int, int]] = []
         for line in path.read_text().splitlines():
             fields = line.split()
             if fields and fields[0] == "v":
                 vertices.append([float(value) for value in fields[1:4]])
+            elif fields and fields[0] == "f":
+                indices: list[int] = []
+                for token in fields[1:]:
+                    index_text = token.split("/", 1)[0]
+                    index = int(index_text)
+                    if index == 0:
+                        raise ValueError(f"OBJ 面索引不能为零：{path}")
+                    indices.append(index - 1 if index > 0 else len(vertices) + index)
+                if len(indices) < 3:
+                    raise ValueError(f"OBJ 面顶点不足：{path}")
+                triangles.extend((indices[0], indices[index], indices[index + 1]) for index in range(1, len(indices) - 1))
         if len(vertices) < 8:
             raise ValueError(f"CAD 网格顶点不足：{path}")
-        return np.asarray(vertices, dtype=np.float64)
+        vertex_array = np.asarray(vertices, dtype=np.float64)
+        triangle_array = np.asarray(triangles, dtype=np.int64)
+        if len(triangle_array) == 0 or np.any(triangle_array < 0) or np.any(triangle_array >= len(vertex_array)):
+            raise ValueError(f"CAD OBJ 缺少有效三角面：{path}")
+        return vertex_array, triangle_array
 
     def _load_geometry(self, raw: dict[str, object]) -> CadGeometry:
         mesh_path = self._root / str(raw["mesh"])
-        vertices = self._load_obj_vertices(mesh_path)
+        vertices, triangles = self._load_obj_mesh(mesh_path)
         annotation_path = self._root / str(raw["grasp_annotation"])
         annotation = json.loads(annotation_path.read_text())
         if annotation.get("model_id") != raw["model_id"]:
@@ -352,6 +372,7 @@ class ObjectCatalog:
             geometry_type=str(raw["geometry_type"]),
             mesh_path=mesh_path,
             vertices_object_m=vertices,
+            triangles_object=triangles,
             dimensions_m=dimensions,
             height_m=float(dimensions[2]),
             symmetry_type=str(symmetry["type"]),  # type: ignore[index]
@@ -439,6 +460,7 @@ class ObjectCatalog:
             scene_object_id=instance.scene_object_id,
             mesh_path=geometry.mesh_path,
             vertices_object_m=geometry.vertices_object_m,
+            triangles_object=geometry.triangles_object,
             dimensions_m=geometry.dimensions_m,
             height_m=geometry.height_m,
             symmetry_type=geometry.symmetry_type,
@@ -757,11 +779,133 @@ class MugHandleCadMatcher:
         )
 
 
+class GenericMeshCadMatcher:
+    """桌面 OBJ 的通用点云--网格表面兜底匹配器。
+
+    它不依赖类别、尺寸公式或物体真值：从 OBJ 三角面均匀采样表面点，对固定
+    的桌面竖直轴枚举 yaw，并以修剪后的单向 Chamfer 距离细化平移。桌面物体通常
+    保持竖直，因此该安全兜底只输出绕 Z 的姿态；任意 roll/pitch、特征全局配准和
+    point-to-plane ICP/GICP 仍属于后续通用 6D 匹配工作，不能在此处伪称已支持。
+    """
+
+    @staticmethod
+    def _surface_samples(model: CadModel) -> np.ndarray:
+        triangles = model.vertices_object_m[model.triangles_object]
+        double_areas = np.linalg.norm(
+            np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1
+        )
+        if not np.all(np.isfinite(double_areas)) or float(double_areas.sum()) <= 1e-12:
+            raise RuntimeError(f"通用 CAD 网格表面积非法：{model.mesh_path}")
+        count = min(900, max(300, len(triangles) * 4))
+        generator = np.random.default_rng(20260923)
+        selected = generator.choice(len(triangles), size=count, p=double_areas / double_areas.sum())
+        first = generator.random(count)
+        second = generator.random(count)
+        root_first = np.sqrt(first)
+        barycentric = np.column_stack((1.0 - root_first, root_first * (1.0 - second), root_first * second))
+        return (triangles[selected] * barycentric[:, :, None]).sum(axis=1)
+
+    @staticmethod
+    def _trimmed_cost(distances: np.ndarray) -> float:
+        keep = max(80, int(len(distances) * 0.70))
+        return float(np.partition(distances, keep - 1)[:keep].mean())
+
+    @staticmethod
+    def _nearest_surface(points: np.ndarray, surface: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        # 采样数上限为 900、点云上限为 500，因此这里的 NumPy 广播不会造成难以
+        # 控制的显存/内存开销，也避免为单个兜底功能额外引入 Open3D 依赖。
+        squared = ((points[:, None, :] - surface[None, :, :]) ** 2).sum(axis=2)
+        indices = np.argmin(squared, axis=1)
+        return np.sqrt(squared[np.arange(len(points)), indices]), surface[indices]
+
+    def _fit_translation(
+        self, points: np.ndarray, local_surface: np.ndarray, yaw_rad: float, initial_center: np.ndarray
+    ) -> tuple[float, np.ndarray, np.ndarray]:
+        cosine, sine = np.cos(yaw_rad), np.sin(yaw_rad)
+        rotation = np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
+        center = initial_center.copy()
+        for _ in range(5):
+            surface = local_surface @ rotation.T + center
+            _, nearest = self._nearest_surface(points, surface)
+            # 可见点只覆盖 CAD 的一部分，因此只使用中位残差做平移更新，且限制
+            # 单步幅度以免遮挡面把网格拉向错误局部极值。
+            update = np.clip(np.median(points - nearest, axis=0), -0.025, 0.025)
+            center += update
+            if float(np.linalg.norm(update)) < 2e-4:
+                break
+        distances, _ = self._nearest_surface(points, local_surface @ rotation.T + center)
+        return self._trimmed_cost(distances), center, distances
+
+    def match(self, model: CadModel, segmentation: SegmentationResult, frame: UnifiedCameraFrame) -> CadPoseEstimate:
+        if model.geometry_type != "mesh":
+            raise ValueError("GenericMeshCadMatcher 仅处理 geometry_type=mesh")
+        points = _points_from_mask(frame, segmentation.mask)
+        points = points[:: max(1, len(points) // 500)]
+        surface_samples = self._surface_samples(model)
+        mesh_center_object = (model.vertices_object_m.min(axis=0) + model.vertices_object_m.max(axis=0)) / 2.0
+        local_surface = surface_samples - mesh_center_object
+        initial_center = np.median(points, axis=0)
+
+        coarse_candidates = []
+        for yaw_rad in np.linspace(-np.pi, np.pi, 36, endpoint=False):
+            cost, center, _ = self._fit_translation(points, local_surface, float(yaw_rad), initial_center)
+            coarse_candidates.append((cost, float(yaw_rad), center))
+        coarse_candidates.sort(key=lambda candidate: candidate[0])
+
+        refined_candidates = []
+        for _, coarse_yaw, coarse_center in coarse_candidates[:3]:
+            for yaw_rad in coarse_yaw + np.arange(-0.18, 0.1801, 0.01):
+                cost, center, distances = self._fit_translation(points, local_surface, float(yaw_rad), coarse_center)
+                refined_candidates.append((cost, float(yaw_rad), center, distances))
+        residual, yaw_rad, mesh_center_base, distances = min(refined_candidates, key=lambda candidate: candidate[0])
+
+        scale_m = float(np.min(model.dimensions_m))
+        inlier_distance_m = float(np.clip(scale_m * 0.08, 0.004, 0.012))
+        residual_limit_m = inlier_distance_m * 1.8
+        inlier_ratio = float(np.mean(distances < inlier_distance_m))
+        geometry_confidence = float(np.clip((1.0 - residual / residual_limit_m) * inlier_ratio, 0.0, 1.0))
+        if residual > residual_limit_m or inlier_ratio < 0.45 or geometry_confidence < 0.35:
+            raise RuntimeError(
+                f"通用 CAD 网格配准置信度不足：残差={residual:.4f}m，内点率={inlier_ratio:.3f}，"
+                f"几何置信度={geometry_confidence:.3f}"
+            )
+
+        opposite_cost, _, _ = self._fit_translation(points, local_surface, yaw_rad + np.pi, mesh_center_base)
+        yaw_observable = bool(opposite_cost - residual >= inlier_distance_m * 0.20)
+        cosine, sine = np.cos(yaw_rad), np.sin(yaw_rad)
+        rotation = np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
+        transform = np.eye(4)
+        transform[:3, :3] = rotation
+        # 搜索的是 CAD 包围盒中心；输出仍必须是 CAD 原点的世界坐标，供抓取标注
+        # ``T_object_grasp`` 正确相乘。
+        transform[:3, 3] = mesh_center_base - rotation @ mesh_center_object
+        return CadPoseEstimate(
+            model_id=model.model_id,
+            position_base_m=transform[:3, 3],
+            orientation_xyzw=np.array([0.0, 0.0, np.sin(yaw_rad / 2.0), np.cos(yaw_rad / 2.0)]),
+            transform_base_object=transform,
+            surface_residual_m=residual,
+            inlier_ratio=inlier_ratio,
+            segmentation_confidence=segmentation.confidence,
+            geometry_confidence=geometry_confidence,
+            axial_yaw_observable=yaw_observable,
+            cylinder_axis_base=np.array([0.0, 0.0, 1.0]),
+            point_count=len(points),
+            matching_method="generic_mesh_surface_chamfer_yaw_refinement",
+            object_yaw_rad=yaw_rad if yaw_observable else None,
+        )
+
+
 class CadMatcherDispatcher:
     """按已校验的 CAD ``geometry_type`` 选择匹配器。"""
 
     def __init__(self) -> None:
-        self._matchers = {"cylinder": CylinderCadMatcher(), "box": BoxCadMatcher(), "mug_handle": MugHandleCadMatcher()}
+        self._matchers = {
+            "cylinder": CylinderCadMatcher(),
+            "box": BoxCadMatcher(),
+            "mug_handle": MugHandleCadMatcher(),
+            "mesh": GenericMeshCadMatcher(),
+        }
 
     def match(self, model: CadModel, segmentation: SegmentationResult, frame: UnifiedCameraFrame) -> CadPoseEstimate:
         matcher = self._matchers.get(model.geometry_type)
