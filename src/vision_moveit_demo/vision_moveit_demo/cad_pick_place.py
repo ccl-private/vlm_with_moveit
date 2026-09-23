@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import os
 import time
@@ -107,6 +108,11 @@ def main() -> None:
     parser.add_argument("--vnc", action="store_true", help="在 VNC 中显示 CAD 匹配驱动的执行过程。")
     parser.add_argument("--video-dir", type=Path, help="保存 VNC 主视角和腕部相机 MP4 的目录。")
     parser.add_argument(
+        "--force-matcher-type",
+        choices=("mesh",),
+        help="仅用于回归诊断：临时以指定匹配器覆盖目录 geometry_type，不改对象目录。",
+    )
+    parser.add_argument(
         "--attached-speed-scale",
         type=float,
         default=6.0,
@@ -137,6 +143,14 @@ def main() -> None:
         intent = RuleVlmAdapter().infer(arguments.instruction)
         catalog = ObjectCatalog(arguments.root)
         model = catalog.find(intent)
+        catalog_geometry_type = model.geometry_type
+        if arguments.force_matcher_type is not None:
+            model = replace(model, geometry_type=arguments.force_matcher_type)
+            print(
+                f"[匹配器诊断] 目录类型={catalog_geometry_type}，本回合临时覆盖为 {model.geometry_type}；"
+                "抓取标注和场景实例保持不变。",
+                flush=True,
+            )
         target_object_id = model.scene_object_id
         fixed_frame = simulation.cameras()["fixed"]
         segmentation = ColorThresholdSegmenter().segment(fixed_frame.rgb, intent)
@@ -373,6 +387,8 @@ def main() -> None:
                 "cad_model": {
                     "model_id": model.model_id,
                     "geometry_type": model.geometry_type,
+                    "catalog_geometry_type": catalog_geometry_type,
+                    "matcher_override": arguments.force_matcher_type,
                     "scene_object_id": model.scene_object_id,
                     "mesh": str(model.mesh_path.relative_to(arguments.root)),
                     "symmetry": model.symmetry_type,
