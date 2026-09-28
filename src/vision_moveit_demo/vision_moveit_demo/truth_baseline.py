@@ -205,7 +205,13 @@ class MoveItTrajectoryClient(Node):
         )
 
 
-def _execute_trajectory(executor: MujocoTaskExecutor, trajectory: RobotTrajectory) -> None:
+def _execute_trajectory(
+    executor: MujocoTaskExecutor,
+    trajectory: RobotTrajectory,
+    *,
+    speed_scale: float = 1.70,
+) -> None:
+    """执行 MoveIt 轨迹；局部视觉微动可显式降低速度以保证跟踪裕量。"""
     names = trajectory.joint_trajectory.joint_names
     waypoint_times_s: list[float] = []
     waypoint_positions: list[dict[str, float]] = []
@@ -216,7 +222,11 @@ def _execute_trajectory(executor: MujocoTaskExecutor, trajectory: RobotTrajector
                 target[name.replace("panda_", "")] = float(value)
         waypoint_positions.append(target)
         waypoint_times_s.append(float(point.time_from_start.sec) + float(point.time_from_start.nanosec) * 1e-9)
-    executor.execute_timed_joint_trajectory(waypoint_times_s, waypoint_positions)
+    executor.execute_timed_joint_trajectory(
+        waypoint_times_s,
+        waypoint_positions,
+        speed_scale=speed_scale,
+    )
 
 
 def main() -> None:

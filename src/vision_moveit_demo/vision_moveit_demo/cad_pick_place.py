@@ -177,13 +177,19 @@ def main() -> None:
     parser.add_argument(
         "--active-observation",
         action="store_true",
-        help="抓取前以腕部 RGB-D 执行主动多视角重观测；当前作为通用 mesh 的诊断入口。",
+        help="抓取前以腕部 RGB-D 在粗路径末端进行局部闭环重观测。",
     )
     parser.add_argument(
         "--max-wrist-observations",
         type=int,
         default=3,
-        help="主动观察最多执行的腕部视角数，默认 3。",
+        help="主动观察最多执行的腕部视角数；on_path 最多使用 2 帧，sweep 使用该值，默认 3。",
+    )
+    parser.add_argument(
+        "--active-observation-mode",
+        choices=("on_path", "sweep"),
+        default="on_path",
+        help="on_path：沿粗预抓取路径近距闭环校正（默认）；sweep：旧的环绕多视角诊断模式。",
     )
     parser.add_argument(
         "--active-observation-debug-dir",
@@ -249,6 +255,9 @@ def main() -> None:
             f"yaw={pose.object_yaw_rad!r}，方法={pose.matching_method}",
             flush=True,
         )
+        # on_path 模式始终以固定相机结果作为腕部局部匹配的先验，不会把任何
+        # MuJoCo 物体真值带入控制回路。
+        coarse_pose = pose
         # 正常档以仿真时间一倍速运行；VNC 只显示该节拍，不通过渲染 sleep 改变它。
         executor = MujocoTaskExecutor(
             simulation,
@@ -261,6 +270,7 @@ def main() -> None:
         client = MoveItTrajectoryClient()
         active_observation: dict[str, object] = {
             "enabled": arguments.active_observation,
+            "mode": arguments.active_observation_mode,
             "max_wrist_observations": arguments.max_wrist_observations,
             "views": [],
             "selected_source": "fixed",
@@ -276,7 +286,7 @@ def main() -> None:
                 catalog.fixture_collision_positions(), target_object_id, PlanningPhase.PREGRASP
             )
             time.sleep(1.0)
-            if arguments.active_observation:
+            if arguments.active_observation and arguments.active_observation_mode == "sweep":
                 # 相机相对手掌的外参从当前已标定 MuJoCo 链读取；它是固定刚体关系，
                 # 与任何物体真值无关。观察位围绕粗定位位置均匀展开，避免粗 yaw
                 # 错误时只朝“猜测的把手方向”移动。
@@ -618,6 +628,211 @@ def main() -> None:
             executor.set_display_state("CAD grasp / MoveIt: pregrasp")
             _execute_trajectory(executor, pregrasp_trajectory)
             executor._event("moveit_pregrasp_complete")
+            if arguments.active_observation and arguments.active_observation_mode == "on_path":
+                # 不再先做环绕扫描：粗预抓取本来就是必经安全走廊。到达后直接用
+                # 腕部 RGB-D 做局部校正；相机必须主动注视把手，而不能假定抓取
+                # 姿态下腕部光轴天然朝向目标。若关键区证据不足，最多换一个侧面。
+                # 每次移动都从当前关节状态重新由 MoveIt 规划，不能在线篡改已批准
+                # 的 IK 轨迹。
+                local_observations: list[tuple[object, object, float]] = []
+                refined_pose = None
+                local_failure = None
+                wrist_frame = simulation.cameras(("wrist",))["wrist"]
+                hand_from_camera = np.linalg.inv(_base_from_body(simulation, "hand")) @ wrist_frame.base_from_camera
+                contact_centers, contact_normals = _contact_geometry_base(coarse_pose, (template,))
+                # 使用已在本场景验证可达的 26 cm 半径、30 cm 高度俯视位：相机
+                # 会停在粗预抓取旁约 20 cm 的安全走廊，而不是贴近桌面进入腕部
+                # 奇异/跟踪裕量不足的区域。排序优先把手可见性，再看当前手掌的
+                # 位移距离。
+                on_path_views = generate_observation_views(
+                    coarse_pose.position_base_m,
+                    contact_centers,
+                    contact_normals,
+                    hand_from_camera,
+                    radius_m=0.26,
+                    elevation_m=0.30,
+                )
+                # 观察位必须仍处于粗预抓取末端的局部工作空间。这个上限不是
+                # MoveIt 的碰撞约束替代品，而是防止“为了看一眼”选到桌子另一侧
+                # 的可达解；没有合格近视角时宁可安全拒绝，再由 sweep 诊断模式
+                # 排障，也不把默认执行退化成大绕行。
+                maximum_observation_hand_travel_m = 0.25
+                selected_camera_positions: list[np.ndarray] = []
+                for observation_index in range(min(2, arguments.max_wrist_observations)):
+                    current_hand_position = executor.body_position("hand")
+                    observation_view = None
+                    observation_trajectory = None
+                    observation_hand_travel_m = None
+                    for candidate_view in sorted(
+                        on_path_views,
+                        key=lambda view: (
+                            -view.expected_contact_visibility,
+                            float(np.linalg.norm(view.hand_position_base_m - current_hand_position)),
+                        ),
+                    ):
+                        if any(
+                            np.linalg.norm(candidate_view.camera_position_base_m - previous) < 0.06
+                            for previous in selected_camera_positions
+                        ):
+                            continue
+                        candidate_hand_travel_m = float(
+                            np.linalg.norm(candidate_view.hand_position_base_m - current_hand_position)
+                        )
+                        if candidate_hand_travel_m > maximum_observation_hand_travel_m:
+                            continue
+                        client.publish_joint_state(executor.joint_positions())
+                        time.sleep(0.25)
+                        try:
+                            observation_trajectory = client.request(
+                                candidate_view.hand_position_base_m,
+                                candidate_view.hand_orientation_base_xyzw,
+                            )
+                        except TimeoutError:
+                            continue
+                        observation_view = candidate_view
+                        observation_hand_travel_m = candidate_hand_travel_m
+                        break
+                    if observation_view is None or observation_trajectory is None:
+                        raise RuntimeError("on_path_reobserve_exhausted：没有可达的近距把手观察位")
+                    executor.set_display_state(f"On-path wrist observation {observation_index + 1}")
+                    # 观察位会有明显的腕部转向；采用低于常规 1.7 倍的温和加速，
+                    # 在保持跟踪裕量的同时避免为一次局部观测等待完整原始轨迹时长。
+                    _execute_trajectory(executor, observation_trajectory, speed_scale=1.25)
+                    executor._event(
+                        "on_path_wrist_observation_complete",
+                        view_id=observation_view.view_id,
+                        expected_contact_visibility=observation_view.expected_contact_visibility,
+                        hand_travel_m=observation_hand_travel_m,
+                    )
+                    selected_camera_positions.append(observation_view.camera_position_base_m)
+                    wrist_frame = simulation.cameras(("wrist",))["wrist"]
+                    lateral_radius = 0.5 * float(np.linalg.norm(model.dimensions_m[:2])) + 0.025
+                    wrist_segmentation = ColorThresholdSegmenter().segment(
+                        wrist_frame.rgb,
+                        intent,
+                        frame=wrist_frame,
+                        expected_position_base_m=coarse_pose.position_base_m,
+                        lateral_radius_m=lateral_radius,
+                        z_min_m=float(coarse_pose.position_base_m[2] - model.height_m / 2.0 + 0.004),
+                        z_max_m=float(coarse_pose.position_base_m[2] + model.height_m / 2.0 + 0.025),
+                    )
+                    entry: dict[str, object] = {
+                        "view_id": f"on_path_{observation_index}:{observation_view.view_id}",
+                        "camera_position_base_m": wrist_frame.base_from_camera[:3, 3].tolist(),
+                        "expected_contact_visibility": observation_view.expected_contact_visibility,
+                        "hand_travel_m": observation_hand_travel_m,
+                        "pixel_count": wrist_segmentation.pixel_count,
+                        "contributes_new_camera_baseline": True,
+                    }
+                    if observation_debug_dir is not None:
+                        debug_path = observation_debug_dir / f"on_path_{observation_index}.npz"
+                        np.savez_compressed(
+                            debug_path,
+                            rgb=wrist_frame.rgb,
+                            depth=wrist_frame.depth,
+                            mask=wrist_segmentation.mask,
+                            intrinsic=wrist_frame.intrinsic,
+                            base_from_camera=wrist_frame.base_from_camera,
+                            expected_contact_visibility=np.float64(observation_view.expected_contact_visibility),
+                        )
+                        entry["debug_observation"] = str(debug_path)
+                    local_observations.append(
+                        (wrist_segmentation, wrist_frame, observation_view.expected_contact_visibility)
+                    )
+                    try:
+                        if model.geometry_type in {"mesh", "mug_handle"}:
+                            # 固定相机只提供低权重粗先验；最终把手证据来自近距腕部
+                            # 帧。它使首个腕部停靠位即可形成几何基线，避免环绕扫描。
+                            matching_observations = (
+                                [(segmentation, fixed_frame, 0.15)] + local_observations
+                                if model.geometry_type == "mug_handle"
+                                else [(segmentation, fixed_frame)] + [item[:2] for item in local_observations]
+                            )
+                            refined_pose = matcher_dispatcher.match_multiview(
+                                model,
+                                matching_observations,
+                                yaw_prior_rad=coarse_pose.object_yaw_rad
+                                if model.geometry_type == "mug_handle"
+                                else None,
+                            )
+                        else:
+                            refined_pose = matcher_dispatcher.match(model, wrist_segmentation, wrist_frame)
+                        entry.update(
+                            status="matched",
+                            geometry_confidence=refined_pose.geometry_confidence,
+                            matching_method=refined_pose.matching_method,
+                        )
+                        active_observation["views"].append(entry)
+                        break
+                    except RuntimeError as error:
+                        local_failure = str(error)
+                        entry.update(status="insufficient_evidence", reason=local_failure)
+                        active_observation["views"].append(entry)
+                        if observation_index + 1 >= min(2, arguments.max_wrist_observations):
+                            raise RuntimeError(
+                                f"on_path_reobserve_exhausted：近距腕部校正仍缺少抓取证据：{local_failure}"
+                            ) from error
+                        print(
+                            f"[路径内腕部校正] 第 {observation_index + 1} 帧关键区证据不足，"
+                            "只尝试一个不同侧面的近距观察位。",
+                            flush=True,
+                        )
+                if refined_pose is None:
+                    raise RuntimeError(f"on_path_reobserve_exhausted：{local_failure}")
+                pose = refined_pose
+                segmentation = local_observations[-1][0]
+                active_observation.update(
+                    selected_source="on_path:fixed_plus_wrist",
+                    consensus_count=len(local_observations) + 1,
+                    fused_support_count=len(local_observations),
+                    critical_region_support=pose.critical_region_support,
+                    critical_region_margin=pose.critical_region_margin,
+                    fused_pose={
+                        "position_base_m": pose.position_base_m.tolist(),
+                        "object_yaw_rad": pose.object_yaw_rad,
+                        "geometry_confidence": pose.geometry_confidence,
+                        "surface_residual_m": pose.surface_residual_m,
+                        "point_count": pose.point_count,
+                    },
+                )
+                refined_candidates = grasp_pose_candidates(pose, (template,))
+                if not refined_candidates:
+                    raise RuntimeError("on_path_reobserve_exhausted：精匹配后未生成原 CAD 抓取框")
+                template, refined_grasp_position, grasp_orientation = refined_candidates[0]
+                grasp_position = refined_grasp_position + reachability_offset
+                tcp_offset = _rotate_vector_by_quaternion(np.array([0.0, 0.0, -0.082]), grasp_orientation)
+                moveit_pregrasp = (
+                    grasp_position
+                    + np.array([0.005, 0.0, template.approach_clearance_m])
+                    + tcp_offset
+                )
+                # 从腕部观测的当前真实关节状态规划剩余短路径，而不是继续复用粗
+                # 位姿下生成的长轨迹。
+                client.publish_joint_state(executor.joint_positions())
+                time.sleep(0.25)
+                executor.set_display_state("On-path corrected pregrasp / MoveIt")
+                _execute_trajectory(executor, client.request(moveit_pregrasp, grasp_orientation))
+                executor._event(
+                    "on_path_pose_correction_complete",
+                    correction_position_m=(pose.position_base_m - coarse_pose.position_base_m).tolist(),
+                )
+                moveit_grasp_position = grasp_position + tcp_offset
+                placement = catalog.physical_placement_targets(
+                    model, template, pose.transform_base_object[:3, :3]
+                )
+                tray_center = placement.tray_center_base_m
+                targets = [
+                    ("approach", moveit_grasp_position),
+                    ("lift", grasp_position + np.array([0.0, 0.0, template.lift_clearance_m]) + tcp_offset),
+                    ("place_above", placement.gripper_above_base_m + tcp_offset),
+                    ("place_descend", placement.gripper_release_base_m + tcp_offset),
+                ]
+                print(
+                    f"[路径内腕部校正] 观察帧={len(local_observations)}，"
+                    f"位置修正={np.linalg.norm(pose.position_base_m - coarse_pose.position_base_m):.4f}m，"
+                    f"置信度={pose.geometry_confidence:.3f}",
+                    flush=True,
+                )
             executor.set_display_state("CAD grasp / MoveIt: approach")
             # 已到达上方安全位后才移除目标碰撞盒，让末段接近能够建立真实把手接触。
             client.publish_task_scene(
