@@ -23,6 +23,7 @@ from .cad_matching import (
     RuleVlmAdapter,
     grasp_pose_candidates,
 )
+from .active_perception import generate_observation_views
 from .stage2_executor import MujocoTaskExecutor
 from .truth_baseline import MoveItTrajectoryClient, _execute_trajectory
 from .unified_scene import UnifiedPandaCupSimulation
@@ -101,6 +102,67 @@ def _attached_pose_in_hand(
     return pose
 
 
+def _base_from_body(simulation: UnifiedPandaCupSimulation, body_name: str) -> np.ndarray:
+    """读取当前 MuJoCo 刚体位姿；只用于已知手眼标定，不读取目标真值。"""
+    body_id = simulation.model.body(body_name).id
+    transform = np.eye(4)
+    transform[:3, :3] = simulation.data.xmat[body_id].reshape(3, 3)
+    transform[:3, 3] = simulation.data.xpos[body_id]
+    return transform
+
+
+def _contact_geometry_base(pose, templates) -> tuple[np.ndarray, np.ndarray]:
+    """将 CAD 标注的相对接触面变换到基座系，供观察位规划使用。"""
+    rotation = pose.transform_base_object[:3, :3]
+    centers, normals = [], []
+    for template in templates:
+        pair = template.opposing_contact_pair
+        for surface in (pair.positive_surface, pair.negative_surface):
+            centers.append(pose.position_base_m + rotation @ surface.center_object_m)
+            normals.append(rotation @ surface.normal_object)
+    return np.asarray(centers), np.asarray(normals)
+
+
+def _retreat_observation_trajectory(
+    executor: MujocoTaskExecutor,
+    trajectory,
+    start_joint_positions: dict[str, float],
+) -> None:
+    """沿已验证的观察轨迹反向退出，避免以观察位作为下一次规划的起始构型。
+
+    腕部观察位的目标是取得图像，而不是作为抓取规划的中间状态。反向复用刚刚
+    由 MoveIt 生成的轨迹，既不引入新的 IK 求解，也不以直线插值穿过未知障碍物。
+    """
+    names = trajectory.joint_trajectory.joint_names
+    points = list(trajectory.joint_trajectory.points)
+    if not points:
+        raise RuntimeError("主动观察返回失败：MoveIt 轨迹没有关节路点")
+    times = [float(point.time_from_start.sec) + float(point.time_from_start.nanosec) * 1e-9 for point in points]
+    duration_s = max(times[-1], 1e-3)
+    retreat_times: list[float] = []
+    retreat_positions: list[dict[str, float]] = []
+    for point, point_time_s in zip(reversed(points), reversed(times)):
+        target = dict(start_joint_positions)
+        for name, value in zip(names, point.positions):
+            if name.startswith("panda_joint"):
+                target[name.replace("panda_", "")] = float(value)
+        retreat_positions.append(target)
+        retreat_times.append(duration_s - point_time_s)
+    # 轨迹的第一个路点通常就是起始状态；若规划器省略了它，明确补上从而回到
+    # 本次观察前的已验证状态。
+    if any(abs(retreat_positions[-1][name] - value) > 1e-4 for name, value in start_joint_positions.items()):
+        retreat_positions.append(dict(start_joint_positions))
+        retreat_times.append(duration_s + 0.05)
+    executor.execute_timed_joint_trajectory(retreat_times, retreat_positions)
+
+
+def _yaw_distance_rad(first: float | None, second: float | None) -> float:
+    """计算桌面 yaw 的最短角差；不可观测 yaw 不允许作为主动观察的一致性证据。"""
+    if first is None or second is None:
+        return float("inf")
+    return float(abs(np.arctan2(np.sin(first - second), np.cos(first - second))))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="阶段 3：语义选模 CAD 匹配抓取基线")
     parser.add_argument("--instruction", default="抓取红色杯子并放到托盘")
@@ -113,12 +175,30 @@ def main() -> None:
         help="仅用于回归诊断：临时以指定匹配器覆盖目录 geometry_type，不改对象目录。",
     )
     parser.add_argument(
+        "--active-observation",
+        action="store_true",
+        help="抓取前以腕部 RGB-D 执行主动多视角重观测；当前作为通用 mesh 的诊断入口。",
+    )
+    parser.add_argument(
+        "--max-wrist-observations",
+        type=int,
+        default=3,
+        help="主动观察最多执行的腕部视角数，默认 3。",
+    )
+    parser.add_argument(
+        "--active-observation-debug-dir",
+        type=Path,
+        help="可选：保存每个成功到达腕部观察位的 RGB-D、掩码和标定，用于离线诊断；不参与控制。",
+    )
+    parser.add_argument(
         "--attached-speed-scale",
         type=float,
         default=6.0,
         help="夹住物体后的轨迹时长倍率，默认 6.0；数值越小越快。",
     )
     arguments = parser.parse_args()
+    if arguments.max_wrist_observations <= 0:
+        raise ValueError("--max-wrist-observations 必须为正数")
 
     simulation = UnifiedPandaCupSimulation(arguments.root, create_renderers=False)
     viewer = None
@@ -154,18 +234,14 @@ def main() -> None:
         target_object_id = model.scene_object_id
         fixed_frame = simulation.cameras()["fixed"]
         segmentation = ColorThresholdSegmenter().segment(fixed_frame.rgb, intent)
-        pose = CadMatcherDispatcher().match(model, segmentation, fixed_frame)
+        matcher_dispatcher = CadMatcherDispatcher()
+        pose = matcher_dispatcher.match(model, segmentation, fixed_frame)
         templates = tuple(
             template for template in model.grasp_templates
             if intent.grasp_region is None or template.grasp_region == intent.grasp_region
         )
         if not templates:
             raise RuntimeError(f"CAD 模型没有与语义抓取区域匹配的抓取框：{intent.grasp_region}")
-        candidates = grasp_pose_candidates(pose, templates)
-        # 横向把手抓取框（手腕绕工具 Z 旋转 90°）下，MoveIt ``panda_hand``
-        # 参考点相对 MuJoCo 指尖工作点低约 82 mm，故目标参考点须向上补偿。
-        # 该外参来自闭爪前记录的真实 pad 位姿，避免把手上方/下方的伪接触。
-        # CAD 标注与接触判定始终使用真实指尖工作点坐标系。
         print(
             "[视觉 CAD 配准] "
             f"目标={target_object_id}，实例像素={segmentation.pixel_count}，"
@@ -173,16 +249,6 @@ def main() -> None:
             f"yaw={pose.object_yaw_rad!r}，方法={pose.matching_method}",
             flush=True,
         )
-        for candidate_template, candidate_position, candidate_orientation in candidates:
-            print(
-                "[CAD 抓取候选] "
-                f"标注={candidate_template.template_id}，"
-                f"抓取位=({candidate_position[0]:.4f}, {candidate_position[1]:.4f}, {candidate_position[2]:.4f})，"
-                f"四元数_xyzw=({candidate_orientation[0]:.4f}, {candidate_orientation[1]:.4f}, "
-                f"{candidate_orientation[2]:.4f}, {candidate_orientation[3]:.4f})，"
-                f"预抓取净空={candidate_template.approach_clearance_m:.3f}m",
-                flush=True,
-            )
         # 正常档以仿真时间一倍速运行；VNC 只显示该节拍，不通过渲染 sleep 改变它。
         executor = MujocoTaskExecutor(
             simulation,
@@ -193,6 +259,15 @@ def main() -> None:
         executor.set_display_state(f"CAD match complete: {target_object_id} / {model.model_id}")
         rclpy.init()
         client = MoveItTrajectoryClient()
+        active_observation: dict[str, object] = {
+            "enabled": arguments.active_observation,
+            "max_wrist_observations": arguments.max_wrist_observations,
+            "views": [],
+            "selected_source": "fixed",
+        }
+        observation_debug_dir = arguments.active_observation_debug_dir
+        if observation_debug_dir is not None:
+            observation_debug_dir.mkdir(parents=True, exist_ok=True)
         try:
             # 当前工装位置来自对象目录；目标杯位置仅来自本次 CAD 配准。
             time.sleep(3.0)
@@ -201,38 +276,331 @@ def main() -> None:
                 catalog.fixture_collision_positions(), target_object_id, PlanningPhase.PREGRASP
             )
             time.sleep(1.0)
+            if arguments.active_observation:
+                # 相机相对手掌的外参从当前已标定 MuJoCo 链读取；它是固定刚体关系，
+                # 与任何物体真值无关。观察位围绕粗定位位置均匀展开，避免粗 yaw
+                # 错误时只朝“猜测的把手方向”移动。
+                wrist_frame = simulation.cameras(("wrist",))["wrist"]
+                hand_from_camera = np.linalg.inv(_base_from_body(simulation, "hand")) @ wrist_frame.base_from_camera
+                contact_centers, contact_normals = _contact_geometry_base(pose, templates)
+                observation_views = generate_observation_views(
+                    pose.position_base_m,
+                    contact_centers,
+                    contact_normals,
+                    hand_from_camera,
+                )
+                successful_observations = 0
+                matched_observations: list[tuple[object, object, object, dict[str, object]]] = []
+                successful_camera_positions: list[np.ndarray] = []
+                # ``max_wrist_observations`` 限制成功采集的帧数；不可达/碰撞候选
+                # 必须继续尝试其它方位，不能耗尽重观测预算。
+                for observation_view in observation_views:
+                    if successful_observations >= arguments.max_wrist_observations:
+                        break
+                    executor.set_display_state(f"Active observe / MoveIt: {observation_view.view_id}")
+                    observation_start_joint_positions = executor.joint_positions()
+                    client.publish_joint_state(observation_start_joint_positions)
+                    time.sleep(0.25)
+                    entry: dict[str, object] = {
+                        "view_id": observation_view.view_id,
+                        "expected_contact_visibility": observation_view.expected_contact_visibility,
+                        "visible_contact_indices": list(observation_view.visible_contact_indices),
+                        "camera_position_base_m": observation_view.camera_position_base_m.tolist(),
+                    }
+                    try:
+                        trajectory = client.request(
+                            observation_view.hand_position_base_m,
+                            observation_view.hand_orientation_base_xyzw,
+                        )
+                        _execute_trajectory(executor, trajectory)
+                        executor._event("active_observation_view_complete", view_id=observation_view.view_id)
+                        wrist_frame = simulation.cameras(("wrist",))["wrist"]
+                        # 固定相机只产生粗 pose；腕部精看时以该粗位置的 3D ROI
+                        # 排除颜色相近的桌面与工装，同时保留受高光影响的杯身深度点。
+                        lateral_radius = 0.5 * float(np.linalg.norm(model.dimensions_m[:2])) + 0.025
+                        wrist_segmentation = ColorThresholdSegmenter().segment(
+                            wrist_frame.rgb,
+                            intent,
+                            frame=wrist_frame,
+                            expected_position_base_m=pose.position_base_m,
+                            lateral_radius_m=lateral_radius,
+                            z_min_m=float(pose.position_base_m[2] - model.height_m / 2.0 + 0.004),
+                            z_max_m=float(pose.position_base_m[2] + model.height_m / 2.0 + 0.025),
+                        )
+                        if observation_debug_dir is not None:
+                            debug_path = observation_debug_dir / f"{observation_view.view_id}.npz"
+                            np.savez_compressed(
+                                debug_path,
+                                rgb=wrist_frame.rgb,
+                                depth=wrist_frame.depth,
+                                mask=wrist_segmentation.mask,
+                                intrinsic=wrist_frame.intrinsic,
+                                base_from_camera=wrist_frame.base_from_camera,
+                                expected_contact_visibility=np.float64(observation_view.expected_contact_visibility),
+                            )
+                            entry["debug_observation"] = str(debug_path)
+                        wrist_pose = None
+                        try:
+                            wrist_pose = matcher_dispatcher.match(model, wrist_segmentation, wrist_frame)
+                        except RuntimeError as matching_error:
+                            if model.geometry_type != "mug_handle":
+                                raise
+                            # 单帧不够区分杯身近似对称带来的 yaw 歧义是预期情况；
+                            # 分割已经成功的 RGB-D 帧仍是多视角 CAD 融合的有效证据。
+                            # 不能用“单帧先定准朝向”这个前置条件把它悄悄丢掉。
+                            entry.update(
+                                status="segmented_for_fusion",
+                                reason=f"单帧 yaw 未定，保留点云给多视角关键区验证：{matching_error}",
+                                pixel_count=wrist_segmentation.pixel_count,
+                                score=0.10 * observation_view.expected_contact_visibility,
+                            )
+                        if wrist_pose is not None:
+                            score = wrist_pose.geometry_confidence + 0.10 * observation_view.expected_contact_visibility
+                            entry.update(
+                                status="matched",
+                                pixel_count=wrist_segmentation.pixel_count,
+                                matching_method=wrist_pose.matching_method,
+                                geometry_confidence=wrist_pose.geometry_confidence,
+                                surface_residual_m=wrist_pose.surface_residual_m,
+                                score=score,
+                                position_base_m=wrist_pose.position_base_m.tolist(),
+                                object_yaw_rad=wrist_pose.object_yaw_rad,
+                            )
+                        # 同一名义相机位置的腕部滚转不增加几何基线，因而不能占用
+                        # 观察预算；但它会改变夹爪/前臂对相机的遮挡，仍可能暴露
+                        # 上一帧看不到的把手区域，必须保留到融合点云中。
+                        if any(
+                            np.linalg.norm(observation_view.camera_position_base_m - previous) <= 0.005
+                            for previous in successful_camera_positions
+                        ):
+                            entry.update(
+                                status="redundant_camera_position",
+                                reason="同一相机位置的另一腕部滚转不占观察预算，但其去遮挡点云参与融合",
+                                contributes_new_camera_baseline=False,
+                            )
+                            print(
+                                f"[主动观察融合] 视角={observation_view.view_id}；原因=复用相机位置但保留不同腕部遮挡下的点云",
+                                flush=True,
+                            )
+                            executor.set_display_state(f"Active observe retreat: {observation_view.view_id}")
+                            _retreat_observation_trajectory(
+                                executor, trajectory, observation_start_joint_positions
+                            )
+                            executor._event("active_observation_return_complete", view_id=observation_view.view_id)
+                            matched_observations.append((wrist_pose, wrist_segmentation, wrist_frame, entry))
+                            active_observation["views"].append(entry)
+                            continue
+                        if wrist_pose is None:
+                            print(
+                                f"[主动观察帧] 视角={observation_view.view_id}，"
+                                f"分割点={wrist_segmentation.pixel_count}；单帧 yaw 未定，保留给融合",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[主动观察帧] 视角={observation_view.view_id}，"
+                                f"点={wrist_pose.point_count}，位置=({wrist_pose.position_base_m[0]:.4f}, "
+                                f"{wrist_pose.position_base_m[1]:.4f}, {wrist_pose.position_base_m[2]:.4f})，"
+                                f"yaw={wrist_pose.object_yaw_rad!r}，置信度={wrist_pose.geometry_confidence:.3f}",
+                                flush=True,
+                            )
+                        executor.set_display_state(f"Active observe retreat: {observation_view.view_id}")
+                        _retreat_observation_trajectory(executor, trajectory, observation_start_joint_positions)
+                        executor._event("active_observation_return_complete", view_id=observation_view.view_id)
+                        successful_observations += 1
+                        successful_camera_positions.append(observation_view.camera_position_base_m)
+                        entry["contributes_new_camera_baseline"] = True
+                        matched_observations.append((wrist_pose, wrist_segmentation, wrist_frame, entry))
+                    except (RuntimeError, TimeoutError) as error:
+                        entry.update(status="rejected", reason=str(error))
+                        print(f"[主动观察拒绝] 视角={observation_view.view_id}；原因={error}", flush=True)
+                    active_observation["views"].append(entry)
+                if successful_observations < 2:
+                    active_observation["failure_reason"] = "reobserve_exhausted"
+                    raise RuntimeError(
+                        "reobserve_exhausted：少于两个腕部观察位完成匹配，不能用单帧低约束结果进入抓取"
+                    )
+                if model.geometry_type in {"mesh", "mug_handle"}:
+                    # 通用 mesh 与把手杯的单帧匹配都可能在杯身等重复局部极值之间
+                    # 切换；因此不能拿这些单帧 pose 投票。合并各帧基座系点云后
+                    # 只做一次 CAD 精配准，才是真正的多视角几何约束。
+                    pose = matcher_dispatcher.match_multiview(
+                        model,
+                        [
+                            (
+                                item[1],
+                                item[2],
+                                float(item[3]["expected_contact_visibility"]),
+                            )
+                            if model.geometry_type == "mug_handle"
+                            else (item[1], item[2])
+                            for item in matched_observations
+                        ],
+                        yaw_prior_rad=pose.object_yaw_rad if model.geometry_type == "mug_handle" else None,
+                    )
+                    if pose.object_yaw_rad is None:
+                        active_observation["failure_reason"] = "fused_yaw_unobservable"
+                        raise RuntimeError("reobserve_exhausted：多视角 CAD 融合未能辨识 yaw，拒绝生成抓取姿态")
+                    print(
+                        f"[主动观察融合候选] 位置=({pose.position_base_m[0]:.4f}, "
+                        f"{pose.position_base_m[1]:.4f}, {pose.position_base_m[2]:.4f})，"
+                        f"yaw={pose.object_yaw_rad!r}，置信度={pose.geometry_confidence:.3f}",
+                        flush=True,
+                    )
+                    if model.geometry_type == "mesh":
+                        fused_support_count = sum(
+                            np.linalg.norm(item[0].position_base_m - pose.position_base_m) <= 0.030
+                            and _yaw_distance_rad(item[0].object_yaw_rad, pose.object_yaw_rad) <= 0.75
+                            for item in matched_observations
+                        )
+                        if fused_support_count < 2:
+                            active_observation["failure_reason"] = "fused_pose_insufficient_independent_support"
+                            active_observation["fused_support_count"] = fused_support_count
+                            raise RuntimeError(
+                                "reobserve_exhausted：融合 mesh pose 未获得至少两个独立腕部视角支持，拒绝猜测抓取姿态"
+                            )
+                    else:
+                        # 杯身近似旋转对称，单帧的全局 mesh yaw 没有可投票的意义。
+                        # MugHandleCadMatcher 已在内部要求被抓取的把手外竖条得到
+                        # 足量单视角支持，并与相隔 20° 以上的替代朝向拉开差距。
+                        # 这里复用该可审计的关键区域门禁，不能再用错误的单帧 yaw
+                        # 反向否决多视角证据。
+                        fused_support_count = sum(
+                            item[3].get("contributes_new_camera_baseline", False) for item in matched_observations
+                        )
+                        active_observation["critical_region_support"] = pose.critical_region_support
+                        active_observation["critical_region_margin"] = pose.critical_region_margin
+                    segmentation = max(matched_observations, key=lambda item: item[1].confidence)[1]
+                    active_observation["selected_source"] = "fused:" + ",".join(
+                        str(item[3]["view_id"]) for item in matched_observations
+                    )
+                    active_observation["consensus_count"] = len(matched_observations)
+                    active_observation["fused_support_count"] = fused_support_count
+                    active_observation["fused_pose"] = {
+                        "position_base_m": pose.position_base_m.tolist(),
+                        "object_yaw_rad": pose.object_yaw_rad,
+                        "geometry_confidence": pose.geometry_confidence,
+                        "surface_residual_m": pose.surface_residual_m,
+                        "point_count": pose.point_count,
+                    }
+                    consensus = matched_observations
+                else:
+                    consensus_groups = []
+                    for seed_pose, _, _, _ in matched_observations:
+                        group = [
+                            item
+                            for item in matched_observations
+                            if np.linalg.norm(item[0].position_base_m - seed_pose.position_base_m) <= 0.025
+                            and _yaw_distance_rad(item[0].object_yaw_rad, seed_pose.object_yaw_rad) <= 0.25
+                        ]
+                        consensus_groups.append(group)
+                    consensus = max(consensus_groups, key=len)
+                    if len(consensus) < 2:
+                        active_observation["failure_reason"] = "pose_hypotheses_disagree"
+                        raise RuntimeError(
+                            "reobserve_exhausted：腕部观察位未在 25 mm / 0.25 rad 门槛内形成一致 pose，拒绝猜测抓取姿态"
+                        )
+                    pose, segmentation, _, selected_entry = max(consensus, key=lambda item: item[0].geometry_confidence)
+                    active_observation["selected_source"] = selected_entry["view_id"]
+                    active_observation["consensus_count"] = len(consensus)
+                print(
+                    f"[主动观察] 已完成 {successful_observations} 个腕部视角，其中 {len(consensus)} 个 pose 一致；"
+                    f"选用={active_observation['selected_source']}，位置=({pose.position_base_m[0]:.4f}, "
+                    f"{pose.position_base_m[1]:.4f}, {pose.position_base_m[2]:.4f})，"
+                    f"yaw={pose.object_yaw_rad!r}，几何置信度={pose.geometry_confidence:.3f}",
+                    flush=True,
+                )
             motion_wall_start = time.monotonic()
             executor.set_gripper(opened=True)
+            candidates = grasp_pose_candidates(pose, templates)
+            # 横向把手抓取框（手腕绕工具 Z 旋转 90°）下，MoveIt ``panda_hand``
+            # 参考点相对 MuJoCo 指尖工作点低约 82 mm，故目标参考点须向上补偿。
+            # 该外参来自闭爪前记录的真实 pad 位姿，避免把手上方/下方的伪接触。
+            # CAD 标注与接触判定始终使用真实指尖工作点坐标系。
+            for candidate_template, candidate_position, candidate_orientation in candidates:
+                print(
+                    "[CAD 抓取候选] "
+                    f"标注={candidate_template.template_id}，"
+                    f"抓取位=({candidate_position[0]:.4f}, {candidate_position[1]:.4f}, {candidate_position[2]:.4f})，"
+                    f"四元数_xyzw=({candidate_orientation[0]:.4f}, {candidate_orientation[1]:.4f}, "
+                    f"{candidate_orientation[2]:.4f}, {candidate_orientation[3]:.4f})，"
+                    f"预抓取净空={candidate_template.approach_clearance_m:.3f}m",
+                    flush=True,
+                )
             selected = None
             rejected_candidates: list[dict[str, str]] = []
+            # CAD 位姿和手眼标定都可能留下几毫米的残差。不能因为名义预抓取位
+            # 正好落在 Panda 的 IK/碰撞边界外就放弃一个已经可靠匹配的把手；但也
+            # 不能在工作空间里任意搜索。只枚举桌面平面内 4 mm 的有限邻域，完整
+            # 保持 CAD 标注的夹爪朝向，并先让 MoveIt 验证每个预抓取候选。
+            reachability_offsets_base = (
+                np.array([0.0, 0.0, 0.0]),
+                np.array([-0.004, 0.0, 0.0]),
+                np.array([0.0, 0.004, 0.0]),
+                np.array([-0.004, 0.004, 0.0]),
+                np.array([0.004, 0.0, 0.0]),
+                np.array([0.0, -0.004, 0.0]),
+                np.array([0.004, -0.004, 0.0]),
+                np.array([-0.004, -0.004, 0.0]),
+                np.array([0.004, 0.004, 0.0]),
+            )
             for candidate_template, candidate_position, candidate_orientation in candidates:
-                pregrasp = candidate_position + np.array([0.0, 0.0, candidate_template.approach_clearance_m])
-                # 横向对称夹取的最终中心相对安全通道向 -X 偏 5 mm。先到无偏移
-                # 的高位（已验证可达），再在目标上方横移，避免 OMPL 在带杯身
-                # 碰撞体时拒绝最终抓取中心的整段预抓取路径。
-                safe_pregrasp = pregrasp + np.array([0.005, 0.0, 0.0])
-                tcp_offset = _rotate_vector_by_quaternion(
-                    np.array([0.0, 0.0, -0.082]), candidate_orientation
-                )
-                moveit_pregrasp = safe_pregrasp + tcp_offset
-                executor.set_display_state(f"CAD candidate / MoveIt: {candidate_template.template_id}")
-                client.publish_joint_state(executor.joint_positions())
-                # ROS 2 话题是异步的。必须让规划桥先消费当前 MuJoCo 关节快照，
-                # 否则 VNC 实时渲染下可能按上一阶段状态反复规划，出现“轨迹成功但手没移动”。
-                time.sleep(0.25)
-                try:
-                    pregrasp_trajectory = client.request(
-                        moveit_pregrasp, candidate_orientation
+                for reachability_offset in reachability_offsets_base:
+                    adjusted_position = candidate_position + reachability_offset
+                    pregrasp = adjusted_position + np.array([0.0, 0.0, candidate_template.approach_clearance_m])
+                    # 横向对称夹取的最终中心相对安全通道向 -X 偏 5 mm。先到无偏移
+                    # 的高位（已验证可达），再在目标上方横移，避免 OMPL 在带杯身
+                    # 碰撞体时拒绝最终抓取中心的整段预抓取路径。
+                    safe_pregrasp = pregrasp + np.array([0.005, 0.0, 0.0])
+                    tcp_offset = _rotate_vector_by_quaternion(
+                        np.array([0.0, 0.0, -0.082]), candidate_orientation
                     )
-                except TimeoutError as error:
-                    print(f"[MoveIt 预抓取失败] 标注={candidate_template.template_id}；原因={error}", flush=True)
-                    rejected_candidates.append({"frame_id": candidate_template.template_id, "reason": str(error)})
-                    continue
-                selected = (candidate_template, candidate_position, candidate_orientation, pregrasp_trajectory)
-                break
+                    moveit_pregrasp = safe_pregrasp + tcp_offset
+                    offset_text = (
+                        f"({reachability_offset[0]:+.3f}, {reachability_offset[1]:+.3f}, "
+                        f"{reachability_offset[2]:+.3f})m"
+                    )
+                    executor.set_display_state(f"CAD candidate / MoveIt: {candidate_template.template_id}")
+                    client.publish_joint_state(executor.joint_positions())
+                    # ROS 2 话题是异步的。必须让规划桥先消费当前 MuJoCo 关节快照，
+                    # 否则 VNC 实时渲染下可能按上一阶段状态反复规划，出现“轨迹成功但手没移动”。
+                    time.sleep(0.25)
+                    try:
+                        pregrasp_trajectory = client.request(
+                            moveit_pregrasp, candidate_orientation
+                        )
+                    except TimeoutError as error:
+                        print(
+                            f"[MoveIt 预抓取失败] 标注={candidate_template.template_id}；"
+                            f"CAD 平面偏移={offset_text}；原因={error}",
+                            flush=True,
+                        )
+                        rejected_candidates.append(
+                            {
+                                "frame_id": candidate_template.template_id,
+                                "offset_base_m": offset_text,
+                                "reason": str(error),
+                            }
+                        )
+                        continue
+                    print(
+                        f"[MoveIt 预抓取候选] 标注={candidate_template.template_id}；"
+                        f"CAD 平面偏移={offset_text}；已通过可达性验证",
+                        flush=True,
+                    )
+                    selected = (
+                        candidate_template,
+                        adjusted_position,
+                        candidate_orientation,
+                        pregrasp_trajectory,
+                        reachability_offset,
+                    )
+                    break
+                if selected is not None:
+                    break
             if selected is None:
                 raise RuntimeError(f"MoveIt 未找到可执行的 CAD 抓取标注候选：{rejected_candidates}")
-            template, grasp_position, grasp_orientation, pregrasp_trajectory = selected
+            template, grasp_position, grasp_orientation, pregrasp_trajectory, reachability_offset = selected
             tcp_offset = _rotate_vector_by_quaternion(
                 np.array([0.0, 0.0, -0.082]), grasp_orientation
             )
@@ -251,18 +619,37 @@ def main() -> None:
             _execute_trajectory(executor, pregrasp_trajectory)
             executor._event("moveit_pregrasp_complete")
             executor.set_display_state("CAD grasp / MoveIt: approach")
-            if target_object_id == "yellow_mug":
-                # 结束场景静置约束；从此处开始杯子只受真实接触动力学与夹持约束影响。
-                simulation.data.eq_active[simulation.model.equality("yellow_mug_rest").id] = 0
-                import mujoco
-                mujoco.mj_forward(simulation.model, simulation.data)
-                print("[场景静置] 已解除 yellow_mug_rest，开始真实物理接近", flush=True)
             # 已到达上方安全位后才移除目标碰撞盒，让末段接近能够建立真实把手接触。
             client.publish_task_scene(
                 catalog.fixture_collision_positions(), target_object_id, PlanningPhase.APPROACH
             )
             grasp_confirmed = False
-            for attempt in range(1, 13):
+            # 视觉 pose 的末端不确定度会集中放大到细把手的接触条上。对该类
+            # 抓取，成熟产线会在 CAD 局部接触面附近进行受限的力/接触验证搜索，
+            # 而不是把第一次闭合失败直接解释为“视觉可以任意猜”。偏移均不超过
+            # 4 mm，且仅沿已标注的夹爪闭合轴和把手径向轴；每一次都必须通过同一
+            # 对真实碰撞面的双侧接触门禁。
+            if target_object_id == "yellow_mug":
+                grasp_search_offsets_object = (
+                    np.array([0.0, 0.0, 0.0]),
+                    np.array([0.0, 0.004, 0.0]),
+                    np.array([-0.004, 0.004, 0.0]),
+                    np.array([-0.004, 0.0, 0.0]),
+                    np.array([0.004, 0.004, 0.0]),
+                    np.array([0.0, -0.004, 0.0]),
+                    np.array([0.004, 0.0, 0.0]),
+                    np.array([-0.004, -0.004, 0.0]),
+                    np.array([0.004, -0.004, 0.0]),
+                )
+            else:
+                grasp_search_offsets_object = (np.zeros(3),)
+            max_grasp_attempts = 12 if target_object_id == "magenta_block" else len(grasp_search_offsets_object)
+            for attempt in range(1, max_grasp_attempts + 1):
+                offset_object = grasp_search_offsets_object[min(attempt - 1, len(grasp_search_offsets_object) - 1)]
+                attempt_grasp_position = grasp_position + pose.transform_base_object[:3, :3] @ offset_object
+                attempt_moveit_grasp_position = attempt_grasp_position + tcp_offset
+                attempt_pregrasp = attempt_grasp_position + np.array([0.0, 0.0, template.approach_clearance_m])
+                attempt_moveit_pregrasp = attempt_pregrasp + np.array([0.005, 0.0, 0.0]) + tcp_offset
                 if attempt > 1:
                     executor.set_gripper(opened=True)
                     executor.set_display_state(f"CAD grasp retry {attempt}: pregrasp")
@@ -270,7 +657,7 @@ def main() -> None:
                     time.sleep(0.25)
                     try:
                         retry_pregrasp = client.request(
-                            moveit_pregrasp,
+                            attempt_moveit_pregrasp,
                             candidate_orientation,
                         )
                         _execute_trajectory(executor, retry_pregrasp)
@@ -288,7 +675,7 @@ def main() -> None:
                     _execute_trajectory(
                         executor,
                         client.request(
-                            moveit_grasp_position,
+                            attempt_moveit_grasp_position,
                             grasp_orientation,
                         ),
                     )
@@ -319,12 +706,28 @@ def main() -> None:
                         ),
                         required_object_geometries=template.contact_collision_geometries,
                     )
+                    if target_object_id == "yellow_mug":
+                        # ``attach`` 已确认不只是接触而且两指分别处于 CAD 标注的
+                        # 相对面，至此才可解除静置。若该验证失败，杯子必须保持在
+                        # 原位供下一次毫米级受限搜索使用。
+                        simulation.data.eq_active[simulation.model.equality("yellow_mug_rest").id] = 0
+                        import mujoco
+                        mujoco.mj_forward(simulation.model, simulation.data)
+                        print("[场景静置] 双侧接触与相对面验证已确认，解除 yellow_mug_rest", flush=True)
+                    # 后续抬升、放置和物体在手坐标系中的相对位姿必须使用真正
+                    # 通过接触验证的微调抓取位，而不是初始视觉候选。
+                    grasp_position = attempt_grasp_position
+                    moveit_grasp_position = attempt_moveit_grasp_position
                     grasp_confirmed = True
                     break
                 except (RuntimeError, TimeoutError) as error:
-                    if target_object_id != "magenta_block" or attempt == 12:
+                    if target_object_id not in {"magenta_block", "yellow_mug"} or attempt == max_grasp_attempts:
                         raise
-                    print(f"[抓取重试] 第 {attempt} 次未形成双侧接触：{error}", flush=True)
+                    print(
+                        f"[抓取重试] 第 {attempt} 次未形成双侧接触；"
+                        f"CAD 局部偏移=({offset_object[0]:.3f}, {offset_object[1]:.3f}, {offset_object[2]:.3f})m；原因={error}",
+                        flush=True,
+                    )
             if not grasp_confirmed:
                 raise RuntimeError("洋红色长方体在 12 次真实抓取重试后仍未形成双侧接触")
             if target_object_id == "magenta_block":
@@ -420,8 +823,10 @@ def main() -> None:
                 "grasp_candidate_selection": {
                     "candidate_count": len(candidates),
                     "selected_frame_id": template.template_id,
+                    "selected_reachability_offset_base_m": reachability_offset.tolist(),
                     "rejected_candidates": rejected_candidates,
                 },
+                "active_observation": active_observation,
                 "fixture_tray_center_base_m": tray_center.tolist(),
                 "physical_placement": placement.as_dict(),
                 "physical_release": physical_release.as_dict(),
@@ -444,9 +849,10 @@ def main() -> None:
             if not evaluation_only_success:
                 raise RuntimeError(f"评测发现 {target_object_id} 未落入托盘")
             if viewer is not None:
-                print("CAD 模型匹配回合成功。VNC 主窗口按 Esc 退出。", flush=True)
-                while viewer.render_once(f"Success: CAD matched {target_object_id} in tray"):
-                    time.sleep(1.0 / 30.0)
+                # 成功已经由 MuJoCo 的托盘物理验证确认。只补一帧带成功状态的
+                # 画面后立即返回 finally 关闭录制器，避免 VNC 回合在终态无限录制。
+                viewer.render_once(f"Success: CAD matched {target_object_id} in tray")
+                print("CAD 模型匹配回合成功；正在自动关闭 VNC 并保存 MP4。", flush=True)
         finally:
             client.destroy_node()
             rclpy.shutdown()

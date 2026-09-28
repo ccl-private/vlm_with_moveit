@@ -35,7 +35,26 @@ class MoveItTrajectoryClient(Node):
         message = JointState()
         message.header.stamp = self.get_clock().now().to_msg()
         message.name = [f"panda_joint{index}" for index in range(1, 8)]
-        message.position = [positions[f"joint{index}"] for index in range(1, 8)]
+        # MuJoCo 的位置伺服在硬限位处会偶发地积分越界几个浮点 ulp；把这个
+        # 瞬时遥测原样发给 MoveIt 会让后者因“起始状态越界”拒绝一个本可安全
+        # 规划的目标。这里只钳制到限位内 0.1 mrad，真实执行器仍会在随后轨迹
+        # 中回到该范围；并不放宽任何关节或碰撞约束。
+        # 顺序与 ``panda.xml`` / MoveIt 的 panda_joint1…7 一致；第 2、4、6
+        # 轴的行程比其它转轴窄，不能误用第 1 轴的通用范围。
+        joint_limits = (
+            (-2.8973, 2.8973),
+            (-1.7628, 1.7628),
+            (-2.8973, 2.8973),
+            (-3.0718, -0.0698),
+            (-2.8973, 2.8973),
+            (-0.0175, 3.7525),
+            (-2.8973, 2.8973),
+        )
+        epsilon = 1e-4
+        message.position = [
+            float(np.clip(positions[f"joint{index}"], lower + epsilon, upper - epsilon))
+            for index, (lower, upper) in enumerate(joint_limits, start=1)
+        ]
         self.joint_publisher.publish(message)
 
     def publish_scene(self, snapshot, grasp_target: str | None = None) -> None:

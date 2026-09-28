@@ -134,7 +134,55 @@ class ColorThresholdSegmenter:
             output[np.asarray(rows), np.asarray(columns)] = True
         return output
 
-    def segment(self, rgb: np.ndarray, intent: TaskIntent) -> SegmentationResult:
+    @staticmethod
+    def _spatial_roi_mask(
+        frame: UnifiedCameraFrame,
+        center_base_m: np.ndarray,
+        lateral_radius_m: float,
+        z_min_m: float,
+        z_max_m: float,
+    ) -> np.ndarray:
+        """以粗 pose 建立基座系深度 ROI，移除与目标颜色相近的桌面/工装。
+
+        这是粗到精配准之间的常规工业步骤：ROI 只依赖前一阶段估计和已标定
+        RGB-D，不读取物体真值。上方的 z 下限刻意排除桌面平面，保留杯身与把手。
+        """
+        if lateral_radius_m <= 0.0 or z_max_m <= z_min_m:
+            raise ValueError("空间 ROI 参数无效")
+        depth = frame.depth
+        rows, columns = np.indices(depth.shape)
+        valid = np.isfinite(depth) & (depth > 0.10) & (depth < 3.0)
+        fx, fy = frame.intrinsic[0, 0], frame.intrinsic[1, 1]
+        cx, cy = frame.intrinsic[0, 2], frame.intrinsic[1, 2]
+        homogeneous_camera = np.stack(
+            (
+                (columns - cx) * depth / fx,
+                -(rows - cy) * depth / fy,
+                -depth,
+                np.ones_like(depth),
+            ),
+            axis=-1,
+        )
+        base_points = homogeneous_camera @ frame.base_from_camera.T
+        horizontal_delta = base_points[..., :2] - center_base_m[:2]
+        return (
+            valid
+            & (np.linalg.norm(horizontal_delta, axis=-1) <= lateral_radius_m)
+            & (base_points[..., 2] >= z_min_m)
+            & (base_points[..., 2] <= z_max_m)
+        )
+
+    def segment(
+        self,
+        rgb: np.ndarray,
+        intent: TaskIntent,
+        *,
+        frame: UnifiedCameraFrame | None = None,
+        expected_position_base_m: np.ndarray | None = None,
+        lateral_radius_m: float | None = None,
+        z_min_m: float | None = None,
+        z_max_m: float | None = None,
+    ) -> SegmentationResult:
         red, green, blue = rgb[..., 0], rgb[..., 1], rgb[..., 2]
         selectors = {
             "red": (red > 120) & (green < 100) & (blue < 100),
@@ -149,7 +197,25 @@ class ColorThresholdSegmenter:
             # 定位贴已移除；仅依赖最大连通域会令离相机更近的绿色圆柱被误识别为马克杯。
             "yellow": (red > 120) & (green > 75) & (blue < 38) & (red > green * 1.15) & (green > blue * 2.2),
         }
-        component = self._largest_component(selectors[intent.target_color])
+        candidate = selectors[intent.target_color]
+        source = "hsv_like_color_threshold"
+        roi_arguments = (expected_position_base_m, lateral_radius_m, z_min_m, z_max_m)
+        if any(value is not None for value in roi_arguments):
+            if frame is None or any(value is None for value in roi_arguments):
+                raise ValueError("空间 ROI 分割需要 frame、预估位置、半径和完整 z 范围")
+            roi = self._spatial_roi_mask(
+                frame,
+                np.asarray(expected_position_base_m, dtype=np.float64),
+                float(lateral_radius_m),
+                float(z_min_m),
+                float(z_max_m),
+            )
+            # 颜色先验对相邻物体仍有价值，但高光会令杯身变白。因此 ROI 内的
+            # 高亮低饱和前景也可保留；桌面已由 z 门限排除。
+            bright_foreground = (red > 175) & (green > 145) & (blue < 120)
+            candidate = roi & (candidate | bright_foreground)
+            source = "color_threshold_with_coarse_pose_depth_roi"
+        component = self._largest_component(candidate)
         rows, columns = np.nonzero(component)
         pixel_count = int(len(rows))
         if pixel_count < 120:
@@ -157,7 +223,7 @@ class ColorThresholdSegmenter:
         bbox = (int(columns.min()), int(rows.min()), int(columns.max()) + 1, int(rows.max()) + 1)
         # 目标在当前相机中通常占约千级像素；较小区域将自然降低几何置信度。
         confidence = float(min(1.0, pixel_count / 1200.0))
-        return SegmentationResult(component, confidence, pixel_count, bbox)
+        return SegmentationResult(component, confidence, pixel_count, bbox, source=source)
 
 
 @dataclass(frozen=True)
@@ -249,6 +315,10 @@ class CadPoseEstimate:
     point_count: int
     matching_method: str
     object_yaw_rad: float | None
+    # 对需要绕 Z 定向的非对称抓取，整体 CAD 残差不足以证明夹持区真的可见。
+    # 这两个字段由多视角关键区域匹配器填写；其余 matcher 保持 None。
+    critical_region_support: float | None = None
+    critical_region_margin: float | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -266,6 +336,8 @@ class CadPoseEstimate:
             "point_count": self.point_count,
             "matching_method": self.matching_method,
             "object_yaw_rad": self.object_yaw_rad,
+            "critical_region_support": self.critical_region_support,
+            "critical_region_margin": self.critical_region_margin,
         }
 
 
@@ -729,10 +801,104 @@ class MugHandleCadMatcher:
         opposite_cost = self._mesh_yaw_cost(point_sample, vertex_sample, center, yaw + np.pi)
         return yaw, best_cost, opposite_cost
 
-    def match(self, model: CadModel, segmentation: SegmentationResult, frame: UnifiedCameraFrame) -> CadPoseEstimate:
+    @staticmethod
+    def _yaw_distance(first: float, second: float) -> float:
+        return float(abs(np.arctan2(np.sin(first - second), np.cos(first - second))))
+
+    @staticmethod
+    def _rotation_z(yaw_rad: float) -> np.ndarray:
+        cosine, sine = np.cos(yaw_rad), np.sin(yaw_rad)
+        return np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
+
+    @staticmethod
+    def _voxel_average(points: np.ndarray, voxel_m: float = 0.0025, maximum_points: int = 650) -> np.ndarray:
+        """在单帧内做小体素平均，降低深度噪声而不混合不同观察方向。
+
+        不能把所有相机帧先体素融合：背面未观测和前景遮挡会被错误平均。这里
+        仅对同一已标定 RGB-D 帧的相邻表面点平均，随后每帧相同上限采样。
+        """
+        if len(points) == 0:
+            raise ValueError("体素平均不能处理空点云")
+        keys = np.floor(points / voxel_m).astype(np.int64)
+        _, inverse = np.unique(keys, axis=0, return_inverse=True)
+        counts = np.bincount(inverse)
+        averaged = np.column_stack(
+            [np.bincount(inverse, weights=points[:, axis]) / counts for axis in range(3)]
+        )
+        if len(averaged) <= maximum_points:
+            return averaged
+        return averaged[:: max(1, len(averaged) // maximum_points)]
+
+    @staticmethod
+    def _grasp_critical_vertices(model: CadModel) -> np.ndarray:
+        """从 CAD 抓取标注派生应被视觉确认的把手外竖条表面。
+
+        这里不写死 ``mug_with_handle_v1`` 的把手坐标。夹持对的两个接触面中点是
+        每个 SKU 都必须标注的量；以该中点周围一个随杯高缩放的小包络提取网格
+        表面。它既覆盖两指会接触的外竖条，又不会把占多数的圆柱杯身混进来。
+        """
+        templates = [template for template in model.grasp_templates if template.grasp_region == "handle"]
+        if not templates:
+            raise RuntimeError("马克杯 CAD 缺少 handle 抓取标注，无法验证关键夹持区")
+        template = max(templates, key=lambda item: item.quality)
+        pair = template.opposing_contact_pair
+        midpoint = (pair.positive_surface.center_object_m + pair.negative_surface.center_object_m) / 2.0
+        # 0.36 倍杯高在本 SKU 上为 36 mm：覆盖 56 mm 高的外竖条及其边缘，
+        # 同时保持远小于杯身半径到把手距离，避免退化为“只匹配杯身”。
+        radius_m = float(np.clip(model.height_m * 0.36, 0.020, 0.045))
+        vertices = model.vertices_object_m
+        selected = vertices[np.linalg.norm(vertices - midpoint, axis=1) <= radius_m]
+        if len(selected) < 24:
+            raise RuntimeError("马克杯抓取关键区 CAD 网格采样不足")
+        # OBJ 的三角划分密度可能不均匀；均匀抽样上限使分数不受模型导出细节支配。
+        return selected[:: max(1, len(selected) // 180)]
+
+    @staticmethod
+    def _critical_region_evidence(
+        clouds: list[np.ndarray],
+        critical_vertices_object: np.ndarray,
+        center: np.ndarray,
+        yaw_rad: float,
+        support_distance_m: float = 0.012,
+        view_weights: np.ndarray | None = None,
+    ) -> tuple[float, float, int]:
+        """返回最佳单视角的关键区覆盖率、近邻残差和支持视角编号。
+
+        不把所有视角先拼成一团：一个相机看不到把手是正常遮挡，不应稀释另一
+        相机确实看见把手的证据。CAD→点云方向衡量的是“计划夹持区是否真的有
+        观测支持”，正是工业系统里用于抓取前验真的局部 score。
+        """
+        transformed = critical_vertices_object @ MugHandleCadMatcher._rotation_z(yaw_rad).T + center
+        if view_weights is None:
+            view_weights = np.ones(len(clouds), dtype=np.float64)
+        if len(view_weights) != len(clouds) or np.any(view_weights <= 0.0):
+            raise ValueError("关键抓取区的观察视角权重无效")
+        best_support, best_residual, best_index = -1.0, float("inf"), -1
+        for index, cloud in enumerate(clouds):
+            sample = cloud[:: max(1, len(cloud) // 500)]
+            squared = ((transformed[:, None, :] - sample[None, :, :]) ** 2).sum(axis=2)
+            distances = np.sqrt(squared.min(axis=1))
+            # ``view_weights`` 来自主动观察规划对该接触区的预计可见性。它不会
+            # 伪造点云，也不决定 pose；只避免一个规划上背对把手的低信息视角因
+            # 偶然贴合杯身边缘而压过正对把手的观测。最大权重恒为 1，故分数仍
+            # 可解释为关键 CAD 表面得到的有效覆盖率。
+            support = float(np.mean(distances <= support_distance_m)) * float(view_weights[index])
+            keep = max(8, int(len(distances) * 0.35))
+            residual = float(np.partition(distances, keep - 1)[:keep].mean())
+            if (support, -residual) > (best_support, -best_residual):
+                best_support, best_residual, best_index = support, residual, index
+        return best_support, best_residual, best_index
+
+    def _match_points(
+        self,
+        model: CadModel,
+        points: np.ndarray,
+        segmentation_confidence: float,
+        matching_method: str,
+        fixed_camera_yaw_correction_rad: float,
+    ) -> CadPoseEstimate:
         if model.geometry_type != "mug_handle" or model.symmetry_type != "none":
             raise ValueError("MugHandleCadMatcher 仅支持无旋转对称的带把手马克杯")
-        points = _points_from_mask(frame, segmentation.mask)
         initial = np.median(points, axis=0)
         _, coarse = self._search(points, initial, step=0.006, span=0.085, height=model.height_m)
         _, center = self._search(points, coarse, step=0.0015, span=0.009, height=model.height_m)
@@ -743,9 +909,9 @@ class MugHandleCadMatcher:
         # 不以场景中的彩色标记作为控制依据：其它绿色物体或光照变化会使颜色
         # 阈值产生伪把手，而网格匹配同时比较杯身与把手的几何结构。
         yaw_rad, mesh_cost, opposite_cost = self._estimate_mesh_yaw(model, points, center)
-        # 固定相机视角下，单向可见表面距离会使把手朝向朝可见杯身偏约 18°；
-        # 该项是相机--CAD 标定外参，不依赖物体真值，需在实际相机重标后重估。
-        yaw_rad = float(yaw_rad - 0.314)
+        # 这个补偿只属于旧的固定相机单帧路径。腕部多视角点云已经变换到统一
+        # 基座系，不能把固定相机的经验偏置带入，否则会把真实的多视角证据旋错。
+        yaw_rad = float(yaw_rad + fixed_camera_yaw_correction_rad)
         yaw_margin = opposite_cost - mesh_cost
         if yaw_margin < 0.0015:
             raise RuntimeError(
@@ -769,13 +935,260 @@ class MugHandleCadMatcher:
             transform_base_object=transform,
             surface_residual_m=residual,
             inlier_ratio=inlier_ratio,
-            segmentation_confidence=segmentation.confidence,
+            segmentation_confidence=segmentation_confidence,
             geometry_confidence=geometry_confidence,
             axial_yaw_observable=True,
             cylinder_axis_base=np.array([0.0, 0.0, 1.0]),
             point_count=len(points),
-            matching_method="mug_handle_body_fit_and_visible_mesh_yaw",
+            matching_method=matching_method,
             object_yaw_rad=yaw_rad,
+        )
+
+    def match(self, model: CadModel, segmentation: SegmentationResult, frame: UnifiedCameraFrame) -> CadPoseEstimate:
+        correction = -0.314 if frame.name == "camera_fixed" else 0.0
+        return self._match_points(
+            model,
+            _points_from_mask(frame, segmentation.mask),
+            segmentation.confidence,
+            "mug_handle_body_fit_and_visible_mesh_yaw",
+            correction,
+        )
+
+    def match_multiview(
+        self,
+        model: CadModel,
+        observations: list[tuple[SegmentationResult, UnifiedCameraFrame]],
+        *,
+        yaw_prior_rad: float | None = None,
+    ) -> CadPoseEstimate:
+        """将多个已标定腕部 RGB-D 帧均衡采样后在基座系联合精配准。
+
+        每帧独立限采样，避免近距离视角因像素更密而淹没其它方向；多视角路径
+        不使用固定相机的经验 yaw 偏置。运行时不读取对象真值。
+        """
+        if len(observations) < 2:
+            raise ValueError("马克杯多视角精配准至少需要两帧 RGB-D 观测")
+        clouds = []
+        confidences = []
+        visibility_weights = []
+        for observation in observations:
+            segmentation, frame = observation[:2]
+            cloud = _points_from_mask(frame, segmentation.mask)
+            clouds.append(self._voxel_average(cloud))
+            confidences.append(segmentation.confidence)
+            visibility_weights.append(float(observation[2]) if len(observation) >= 3 else 1.0)
+        # 最有希望看到已标注夹持区的视角作为 1.0；其它视角保留 0.15 的贡献。
+        # 这允许不同腕部滚转补充遮挡面，同时避免预计背对把手的画面因杯身边缘
+        # 的偶然局部贴合主导最终 yaw；最终仍有粗候选 gate 和物理双侧接触。
+        raw_weights = np.asarray(visibility_weights, dtype=np.float64)
+        if np.any(~np.isfinite(raw_weights)) or np.any(raw_weights < 0.0):
+            raise ValueError("主动观察可见性权重非法")
+        view_weights = (0.15 + raw_weights) / float(np.max(0.15 + raw_weights))
+        all_points = np.concatenate(clouds, axis=0)
+        initial = np.median(all_points, axis=0)
+        _, coarse = self._search(all_points, initial, step=0.006, span=0.085, height=model.height_m)
+        _, body_center = self._search(all_points, coarse, step=0.0015, span=0.009, height=model.height_m)
+        critical_vertices = self._grasp_critical_vertices(model)
+
+        # 第一轮仅枚举方位，第二轮才在少数候选周围做平移搜索。这样不会把杯身
+        # 的大面积表面作为 yaw 证据，又能修复多视角圆柱拟合在半遮挡下的数毫米
+        # 中心偏差。整个流程只使用 RGB-D、外参和 CAD 抓取标注。
+        coarse_candidates = []
+        for yaw_rad in np.linspace(-np.pi, np.pi, 72, endpoint=False):
+            support, residual, view_index = self._critical_region_evidence(
+                clouds, critical_vertices, body_center, float(yaw_rad), view_weights=view_weights
+            )
+            coarse_candidates.append((support, -residual, float(yaw_rad), body_center, view_index))
+        coarse_candidates.sort(reverse=True)
+
+        translated_candidates = []
+        translation_offsets = np.array(
+            [[dx, dy, dz] for dx in (-0.008, -0.004, 0.0, 0.004, 0.008)
+             for dy in (-0.008, -0.004, 0.0, 0.004, 0.008)
+             for dz in (-0.003, 0.0, 0.003)],
+            dtype=np.float64,
+        )
+        for _, _, yaw_rad, _, _ in coarse_candidates[:4]:
+            for offset in translation_offsets:
+                center = body_center + offset
+                support, residual, view_index = self._critical_region_evidence(
+                    clouds, critical_vertices, center, yaw_rad, view_weights=view_weights
+                )
+                translated_candidates.append((support, -residual, yaw_rad, center, view_index))
+        translated_candidates.sort(reverse=True)
+
+        refined_candidates = []
+        for _, _, candidate_yaw, candidate_center, _ in translated_candidates[:4]:
+            for yaw_rad in candidate_yaw + np.arange(-0.12, 0.1201, 0.005):
+                yaw_rad = float(np.arctan2(np.sin(yaw_rad), np.cos(yaw_rad)))
+                support, residual, view_index = self._critical_region_evidence(
+                    clouds, critical_vertices, candidate_center, yaw_rad, view_weights=view_weights
+                )
+                refined_candidates.append((support, -residual, yaw_rad, candidate_center, view_index))
+        refined_candidates.sort(reverse=True)
+        _, _, yaw_rad, _, _ = refined_candidates[0]
+        rotation = self._rotation_z(yaw_rad)
+        # 关键区平移搜索的目的只是让细小把手不因杯身中心的初估偏差而漏检，
+        # 不能直接拿来输出对象原点：单个可见把手表面会把它拉向相机。最终平移
+        # 改用全 CAD 表面的稳健点到面细化，且从杯身拟合结果启动，保留多视角
+        # 杯身对位置的约束。
+        mesh_matcher = GenericMeshCadMatcher()
+        mesh_center_object = (model.vertices_object_m.min(axis=0) + model.vertices_object_m.max(axis=0)) / 2.0
+        local_surface = mesh_matcher._surface_samples(model) - mesh_center_object
+        _, mesh_center_base, _ = mesh_matcher._fit_translation(
+            all_points,
+            local_surface,
+            yaw_rad,
+            body_center + rotation @ mesh_center_object,
+        )
+        center = mesh_center_base - rotation @ mesh_center_object
+        # 关键区的第一次搜索允许把手局部平移，是为了避免漏检；现在已有由完整
+        # CAD 表面给出的对象中心，应在这个中心重新比较所有 yaw。否则“局部把手
+        # 被拉向相机时的最高分”可能残留为最终朝向，尤其是在两个候选只差几度时。
+        recentered_coarse = []
+        for candidate_yaw in np.linspace(-np.pi, np.pi, 72, endpoint=False):
+            candidate_support, candidate_residual, candidate_view = self._critical_region_evidence(
+                clouds, critical_vertices, center, float(candidate_yaw), view_weights=view_weights
+            )
+            recentered_coarse.append((candidate_support, -candidate_residual, float(candidate_yaw), candidate_view))
+        recentered_coarse.sort(reverse=True)
+        _, _, recentered_yaw, _ = recentered_coarse[0]
+        recentered_fine = []
+        for candidate_yaw in recentered_yaw + np.arange(-0.12, 0.1201, 0.005):
+            candidate_yaw = float(np.arctan2(np.sin(candidate_yaw), np.cos(candidate_yaw)))
+            candidate_support, candidate_residual, candidate_view = self._critical_region_evidence(
+                clouds, critical_vertices, center, candidate_yaw, view_weights=view_weights
+            )
+            recentered_fine.append((candidate_support, -candidate_residual, candidate_yaw, candidate_view))
+        recentered_fine.sort(reverse=True)
+        _, _, yaw_rad, _ = recentered_fine[0]
+        rotation = self._rotation_z(yaw_rad)
+        _, mesh_center_base, _ = mesh_matcher._fit_translation(
+            all_points,
+            local_surface,
+            yaw_rad,
+            body_center + rotation @ mesh_center_object,
+        )
+        center = mesh_center_base - rotation @ mesh_center_object
+        support, critical_residual, evidence_view = self._critical_region_evidence(
+            clouds, critical_vertices, center, yaw_rad, view_weights=view_weights
+        )
+        alternative_support = max(
+            (
+                self._critical_region_evidence(
+                    clouds, critical_vertices, center, float(candidate_yaw), view_weights=view_weights
+                )[0]
+                for candidate_yaw in np.linspace(-np.pi, np.pi, 72, endpoint=False)
+                if self._yaw_distance(float(candidate_yaw), yaw_rad) >= 0.35
+            ),
+            default=0.0,
+        )
+        support_margin = float(support - alternative_support)
+        used_yaw_prior_recovery = False
+        if yaw_prior_rad is not None:
+            # 弱腕部证据下，完整搜索可能落在杯身边缘的错误局部极值。固定相机
+            # 粗 pose 是另一条独立观测：用它的 yaw 再做一次完整 CAD 平移细化，
+            # 并要求把手区仍有最小可见支持。只有腕部存在强且明确的反证时，才
+            # 允许它推翻粗候选；否则采用“粗候选被腕部复核”的后验 pose。
+            prior_yaw = float(np.arctan2(np.sin(yaw_prior_rad), np.cos(yaw_prior_rad)))
+            prior_rotation = self._rotation_z(prior_yaw)
+            _, prior_mesh_center, _ = mesh_matcher._fit_translation(
+                all_points,
+                local_surface,
+                prior_yaw,
+                body_center + prior_rotation @ mesh_center_object,
+            )
+            prior_center = prior_mesh_center - prior_rotation @ mesh_center_object
+            prior_support, _, prior_view = self._critical_region_evidence(
+                clouds, critical_vertices, prior_center, prior_yaw, view_weights=view_weights
+            )
+            prior_alternative = max(
+                (
+                    self._critical_region_evidence(
+                        clouds, critical_vertices, prior_center, float(candidate_yaw), view_weights=view_weights
+                    )[0]
+                    for candidate_yaw in np.linspace(-np.pi, np.pi, 72, endpoint=False)
+                    if self._yaw_distance(float(candidate_yaw), prior_yaw) >= 0.35
+                ),
+                default=0.0,
+            )
+            prior_margin = float(prior_support - prior_alternative)
+            strong_wrist_override = support >= prior_support + 0.15 and support_margin >= 0.15
+            if prior_support >= 0.035 and not strong_wrist_override:
+                yaw_rad = prior_yaw
+                rotation = prior_rotation
+                center = prior_center
+                support = prior_support
+                support_margin = prior_margin
+                evidence_view = prior_view
+                used_yaw_prior_recovery = True
+        if yaw_prior_rad is not None:
+            prior_distance = self._yaw_distance(yaw_rad, float(yaw_prior_rad))
+            # 固定相机的粗 pose 不是最终抓取答案，却仍是一项独立几何证据。
+            # 当多视角候选与它相差 43° 以上、但关键区本身又没有强覆盖/强差距
+            # 时，不允许一次偶然的局部贴合把姿态翻到另一个大范围 yaw 假设。
+            # 这相当于工业系统的 pose-hypothesis gate；真正清晰的腕部观测仍可
+            # 以更高的覆盖率和 margin 推翻粗先验。
+            if prior_distance > 0.75 and (support < 0.25 or support_margin < 0.15):
+                raise RuntimeError(
+                    "马克杯多视角 yaw 与固定相机粗候选严重分歧且关键区证据不足："
+                    f"分歧={np.rad2deg(prior_distance):.1f}°，覆盖率={support:.3f}，"
+                    f"替代朝向差值={support_margin:.3f}"
+                )
+        # 这是“已标注夹持区在最佳预期视角中的有效可见比例”。没有独立粗
+        # 候选时保持严格的 8% / 6% 门槛；若最终 yaw 与固定相机粗候选相近，
+        # 两路几何证据可共同支撑被部分遮挡的把手，门槛降为 4% / 2.5%。无论
+        # 哪种情况，末端仍必须通过真实双侧接触，不能以视觉置信度代替接触。
+        support_requirement = 0.08 if yaw_prior_rad is None else 0.04
+        margin_requirement = 0.06 if yaw_prior_rad is None else 0.025
+        if support < support_requirement or support_margin < margin_requirement:
+            raise RuntimeError(
+                "马克杯把手抓取关键区证据不足："
+                f"覆盖率={support:.3f}，替代朝向差值={support_margin:.3f}，"
+                f"最佳观察帧={evidence_view}"
+            )
+
+        distances = CylinderCadMatcher._surface_distance(all_points, center, self.body_radius_m, model.height_m)
+        body_residual = self._robust_cost(distances)
+        inlier_ratio = float(np.mean(distances < 0.008))
+        body_confidence = float(np.clip((1.0 - body_residual / 0.012) * min(1.0, inlier_ratio / 0.45), 0.0, 1.0))
+        # support 已按主动观察可见性折减；0.24 是该有效覆盖率达到“充分”的
+        # 标尺。与固定相机粗候选一致时，粗--精两路独立证据共同构成后验置信度；
+        # 大角度分歧仍只能依赖腕部关键区，见上方 hypothesis gate。
+        critical_confidence = float(np.clip(support / 0.24, 0.0, 1.0))
+        if yaw_prior_rad is None:
+            prior_confidence = 0.0
+        else:
+            prior_confidence = float(0.45 * max(0.0, 1.0 - self._yaw_distance(yaw_rad, float(yaw_prior_rad)) / 0.75))
+        geometry_confidence = float(min(body_confidence, max(critical_confidence, prior_confidence)))
+        if body_residual > 0.012 or inlier_ratio < 0.35 or geometry_confidence < 0.38:
+            raise RuntimeError(
+                f"马克杯多视角 CAD 配准置信度不足：杯身残差={body_residual:.4f}m，"
+                f"内点率={inlier_ratio:.3f}，关键区覆盖={support:.3f}，几何置信度={geometry_confidence:.3f}"
+            )
+        transform = np.eye(4)
+        transform[:3, :3] = rotation
+        transform[:3, 3] = center
+        return CadPoseEstimate(
+            model_id=model.model_id,
+            position_base_m=center,
+            orientation_xyzw=np.array([0.0, 0.0, np.sin(yaw_rad / 2.0), np.cos(yaw_rad / 2.0)]),
+            transform_base_object=transform,
+            surface_residual_m=body_residual,
+            inlier_ratio=inlier_ratio,
+            segmentation_confidence=float(np.mean(confidences)),
+            geometry_confidence=geometry_confidence,
+            axial_yaw_observable=True,
+            cylinder_axis_base=np.array([0.0, 0.0, 1.0]),
+            point_count=len(all_points),
+            matching_method=(
+                "mug_handle_multiview_coarse_yaw_prior_and_grasp_region_refinement"
+                if used_yaw_prior_recovery
+                else "mug_handle_multiview_grasp_region_surface_refinement"
+            ),
+            object_yaw_rad=yaw_rad,
+            critical_region_support=support,
+            critical_region_margin=support_margin,
         )
 
 
@@ -836,10 +1249,27 @@ class GenericMeshCadMatcher:
         distances, _ = self._nearest_surface(points, local_surface @ rotation.T + center)
         return self._trimmed_cost(distances), center, distances
 
-    def match(self, model: CadModel, segmentation: SegmentationResult, frame: UnifiedCameraFrame) -> CadPoseEstimate:
+    def _bidirectional_cost(self, points: np.ndarray, surface: np.ndarray) -> float:
+        """以双方都有支持的代价区分“杯身局部贴合”和完整网格解释。
+
+        单向 point-to-CAD Chamfer 允许一个圆柱杯身解释绝大部分像素，即使 CAD
+        把手被旋转到错误方位。主动观察把多个方向的点云合并后，CAD-to-point
+        项会要求把手等非对称表面也在观测中获得支持。两个方向都修剪，以免未
+        被任一相机看见的背面把正确 pose 错误惩罚。
+        """
+        forward, _ = self._nearest_surface(points, surface)
+        backward, _ = self._nearest_surface(surface, points)
+        return 0.45 * self._trimmed_cost(forward) + 0.55 * self._trimmed_cost(backward)
+
+    def _match_points(
+        self,
+        model: CadModel,
+        points: np.ndarray,
+        segmentation_confidence: float,
+        matching_method: str,
+    ) -> CadPoseEstimate:
         if model.geometry_type != "mesh":
             raise ValueError("GenericMeshCadMatcher 仅处理 geometry_type=mesh")
-        points = _points_from_mask(frame, segmentation.mask)
         points = points[:: max(1, len(points) // 500)]
         surface_samples = self._surface_samples(model)
         mesh_center_object = (model.vertices_object_m.min(axis=0) + model.vertices_object_m.max(axis=0)) / 2.0
@@ -849,15 +1279,25 @@ class GenericMeshCadMatcher:
         coarse_candidates = []
         for yaw_rad in np.linspace(-np.pi, np.pi, 36, endpoint=False):
             cost, center, _ = self._fit_translation(points, local_surface, float(yaw_rad), initial_center)
-            coarse_candidates.append((cost, float(yaw_rad), center))
+            surface = local_surface @ np.array([
+                [np.cos(yaw_rad), -np.sin(yaw_rad), 0.0],
+                [np.sin(yaw_rad), np.cos(yaw_rad), 0.0],
+                [0.0, 0.0, 1.0],
+            ]).T + center
+            coarse_candidates.append((self._bidirectional_cost(points, surface), float(yaw_rad), center))
         coarse_candidates.sort(key=lambda candidate: candidate[0])
 
         refined_candidates = []
         for _, coarse_yaw, coarse_center in coarse_candidates[:3]:
             for yaw_rad in coarse_yaw + np.arange(-0.18, 0.1801, 0.01):
-                cost, center, distances = self._fit_translation(points, local_surface, float(yaw_rad), coarse_center)
-                refined_candidates.append((cost, float(yaw_rad), center, distances))
-        residual, yaw_rad, mesh_center_base, distances = min(refined_candidates, key=lambda candidate: candidate[0])
+                residual, center, distances = self._fit_translation(points, local_surface, float(yaw_rad), coarse_center)
+                surface = local_surface @ np.array([
+                    [np.cos(yaw_rad), -np.sin(yaw_rad), 0.0],
+                    [np.sin(yaw_rad), np.cos(yaw_rad), 0.0],
+                    [0.0, 0.0, 1.0],
+                ]).T + center
+                refined_candidates.append((self._bidirectional_cost(points, surface), residual, float(yaw_rad), center, distances))
+        _, residual, yaw_rad, mesh_center_base, distances = min(refined_candidates, key=lambda candidate: candidate[0])
 
         scale_m = float(np.min(model.dimensions_m))
         inlier_distance_m = float(np.clip(scale_m * 0.08, 0.004, 0.012))
@@ -870,8 +1310,20 @@ class GenericMeshCadMatcher:
                 f"几何置信度={geometry_confidence:.3f}"
             )
 
-        opposite_cost, _, _ = self._fit_translation(points, local_surface, yaw_rad + np.pi, mesh_center_base)
-        yaw_observable = bool(opposite_cost - residual >= inlier_distance_m * 0.20)
+        _, opposite_center, _ = self._fit_translation(points, local_surface, yaw_rad + np.pi, mesh_center_base)
+        opposite_rotation = np.array([
+            [np.cos(yaw_rad + np.pi), -np.sin(yaw_rad + np.pi), 0.0],
+            [np.sin(yaw_rad + np.pi), np.cos(yaw_rad + np.pi), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        selected_rotation = np.array([
+            [np.cos(yaw_rad), -np.sin(yaw_rad), 0.0],
+            [np.sin(yaw_rad), np.cos(yaw_rad), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        selected_cost = self._bidirectional_cost(points, local_surface @ selected_rotation.T + mesh_center_base)
+        opposite_cost = self._bidirectional_cost(points, local_surface @ opposite_rotation.T + opposite_center)
+        yaw_observable = bool(opposite_cost - selected_cost >= inlier_distance_m * 0.20)
         cosine, sine = np.cos(yaw_rad), np.sin(yaw_rad)
         rotation = np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
         transform = np.eye(4)
@@ -886,13 +1338,46 @@ class GenericMeshCadMatcher:
             transform_base_object=transform,
             surface_residual_m=residual,
             inlier_ratio=inlier_ratio,
-            segmentation_confidence=segmentation.confidence,
+            segmentation_confidence=segmentation_confidence,
             geometry_confidence=geometry_confidence,
             axial_yaw_observable=yaw_observable,
             cylinder_axis_base=np.array([0.0, 0.0, 1.0]),
             point_count=len(points),
-            matching_method="generic_mesh_surface_chamfer_yaw_refinement",
+            matching_method=matching_method,
             object_yaw_rad=yaw_rad if yaw_observable else None,
+        )
+
+    def match(self, model: CadModel, segmentation: SegmentationResult, frame: UnifiedCameraFrame) -> CadPoseEstimate:
+        return self._match_points(
+            model,
+            _points_from_mask(frame, segmentation.mask),
+            segmentation.confidence,
+            "generic_mesh_surface_chamfer_yaw_refinement",
+        )
+
+    def match_multiview(
+        self,
+        model: CadModel,
+        observations: list[tuple[SegmentationResult, UnifiedCameraFrame]],
+    ) -> CadPoseEstimate:
+        """将多个已外参标定的 RGB-D 观测合并到基座系后统一匹配。
+
+        每一帧先独立限采样，再拼接，避免某一距离很近的相机因像素更多而淹没
+        其它观察方向。这里的融合只使用 RGB-D、相机外参与 CAD，不读取物体真值。
+        """
+        if len(observations) < 2:
+            raise ValueError("多视角 mesh 配准至少需要两帧 RGB-D 观测")
+        clouds = []
+        confidences = []
+        for segmentation, frame in observations:
+            cloud = _points_from_mask(frame, segmentation.mask)
+            clouds.append(cloud[:: max(1, len(cloud) // 350)])
+            confidences.append(segmentation.confidence)
+        return self._match_points(
+            model,
+            np.concatenate(clouds, axis=0),
+            float(np.mean(confidences)),
+            "generic_mesh_multiview_surface_chamfer_yaw_refinement",
         )
 
 
@@ -912,6 +1397,22 @@ class CadMatcherDispatcher:
         if matcher is None:
             raise ValueError(f"未实现 geometry_type={model.geometry_type} 的 CAD 匹配器")
         return matcher.match(model, segmentation, frame)
+
+    def match_multiview(
+        self,
+        model: CadModel,
+        observations: list[tuple[SegmentationResult, UnifiedCameraFrame]],
+        *,
+        yaw_prior_rad: float | None = None,
+    ) -> CadPoseEstimate:
+        matcher = self._matchers.get(model.geometry_type)
+        if not isinstance(matcher, (GenericMeshCadMatcher, MugHandleCadMatcher)):
+            raise ValueError(f"geometry_type={model.geometry_type} 尚未实现多视角 CAD 融合")
+        if isinstance(matcher, MugHandleCadMatcher):
+            return matcher.match_multiview(model, observations, yaw_prior_rad=yaw_prior_rad)
+        if yaw_prior_rad is not None:
+            raise ValueError("通用 mesh 多视角匹配不接受 SKU 专用 yaw 粗先验")
+        return matcher.match_multiview(model, observations)
 
 
 def grasp_pose_from_template(pose: CadPoseEstimate, template: GraspTemplate) -> tuple[np.ndarray, np.ndarray]:
