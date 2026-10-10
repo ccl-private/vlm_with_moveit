@@ -395,11 +395,22 @@ class MujocoTaskExecutor:
             positive_center, positive_normal, negative_center, negative_normal = (
                 np.asarray(value, dtype=np.float64) for value in opposing_contact_pair_object
             )
+            positive_normal /= np.linalg.norm(positive_normal)
+            negative_normal /= np.linalg.norm(negative_normal)
+            surface_separation = abs(float(np.dot(positive_center - negative_center, positive_normal)))
+            if surface_separation <= 0.0:
+                raise RuntimeError("CAD 标注的相对接触面间距无效")
+            # 接触点位于 MuJoCo 碰撞近似（box/capsule）上，并不总会落在 CAD
+            # 理想平面的精确外边界。容差由两面间距决定：12 mm 杯把为 4.5 mm，
+            # 中心至少保留 3 mm 不归属任何一侧，故绝不会把中心或同侧接触误判
+            # 成对夹持；此前固定 3 mm 会把已经跨中心线的左指误拒。
+            surface_tolerance_m = min(0.0045, 0.375 * surface_separation)
 
             def touches_surface(points: list[np.ndarray], center: np.ndarray, normal: np.ndarray) -> bool:
-                # 仅允许落在 CAD 标注面附近 3 mm；此前 15 mm 容差会把同一侧
-                # 把手接触误判为两侧接触，无法保证真正的左右对称夹握。
-                return any(abs(float(np.dot(point - center, normal))) <= 0.003 for point in points)
+                return any(
+                    abs(float(np.dot(point - center, normal))) <= surface_tolerance_m
+                    for point in points
+                )
 
             left_positive = touches_surface(left_contact_points_object, positive_center, positive_normal)
             left_negative = touches_surface(left_contact_points_object, negative_center, negative_normal)
@@ -410,6 +421,7 @@ class MujocoTaskExecutor:
                     "左右指尖接触没有分别落在 CAD 标注的相对面："
                     f"left(+/-)=({left_positive}/{left_negative})，"
                     f"right(+/-)=({right_positive}/{right_negative})；"
+                    f"surface_tolerance_m={surface_tolerance_m:.4f}，"
                     f"left_points_object={np.round(left_contact_points_object, 4).tolist()}；"
                     f"right_points_object={np.round(right_contact_points_object, 4).tolist()}"
                 )

@@ -150,3 +150,97 @@ def generate_observation_views(
                 )
             )
     return sorted(views, key=lambda view: (-view.expected_contact_visibility, view.view_id))
+
+
+def generate_local_observation_views(
+    target_position_base_m: np.ndarray,
+    contact_centers_base_m: np.ndarray,
+    contact_normals_base: np.ndarray,
+    current_camera_position_base_m: np.ndarray,
+    hand_from_camera: np.ndarray,
+    current_camera_rotation_base: np.ndarray | None = None,
+    azimuth_step_deg: float = 12.0,
+    elevation_step_m: float = 0.020,
+) -> list[ObservationView]:
+    """在当前腕部相机附近生成厘米级的下一观察位。
+
+    这不是 ``generate_observation_views`` 的小参数版本：后者用于诊断模式中围绕
+    目标建立全局基线；这里严格以当前相机位置为中心，仅改变方位 ``±12°`` 或
+    高度 ``±2 cm``。调用方仍须用 MoveIt 检验 IK、碰撞与真实手掌位移，并可按
+    抓取模板收紧位移上限。
+    """
+    target = np.asarray(target_position_base_m, dtype=np.float64)
+    centers = np.asarray(contact_centers_base_m, dtype=np.float64)
+    normals = np.asarray(contact_normals_base, dtype=np.float64)
+    current_camera = np.asarray(current_camera_position_base_m, dtype=np.float64)
+    transform_hand_camera = np.asarray(hand_from_camera, dtype=np.float64)
+    if target.shape != (3,) or current_camera.shape != (3,):
+        raise ValueError("目标和当前相机位置必须为长度为 3 的向量")
+    if centers.ndim != 2 or centers.shape[1:] != (3,) or normals.shape != centers.shape:
+        raise ValueError("接触中心和接触法向量的形状无效")
+    if transform_hand_camera.shape != (4, 4):
+        raise ValueError("hand_from_camera 必须为 4x4 变换")
+    if current_camera_rotation_base is not None and np.asarray(current_camera_rotation_base).shape != (3, 3):
+        raise ValueError("current_camera_rotation_base 必须为 3x3 旋转矩阵")
+    if azimuth_step_deg <= 0.0 or elevation_step_m <= 0.0:
+        raise ValueError("局部观察步长必须为正数")
+
+    relative_xy = current_camera[:2] - target[:2]
+    radius_xy = float(np.linalg.norm(relative_xy))
+    if radius_xy < 0.04:
+        # 相机接近正上方时，方位旋转不会产生平移。以抓取面法向的合方向作为
+        # 稳定的横向参考；法向相互抵消时则采用基座 X 轴。
+        normal_xy = normals[:, :2].sum(axis=0)
+        normal_norm = float(np.linalg.norm(normal_xy))
+        relative_xy = (normal_xy / normal_norm if normal_norm >= 1e-6 else np.array([1.0, 0.0])) * 0.10
+        radius_xy = 0.10
+
+    step_rad = np.deg2rad(azimuth_step_deg)
+    camera_from_hand = np.linalg.inv(transform_hand_camera)
+    specs = (
+        ("hold", 0.0, 0.0),
+        ("azimuth_plus", step_rad, 0.0),
+        ("azimuth_minus", -step_rad, 0.0),
+        ("up", 0.0, elevation_step_m),
+        ("down", 0.0, -elevation_step_m),
+    )
+    views: list[ObservationView] = []
+    for view_id, azimuth_delta, elevation_delta in specs:
+        cosine, sine = np.cos(azimuth_delta), np.sin(azimuth_delta)
+        rotated_xy = np.array(
+            [
+                cosine * relative_xy[0] - sine * relative_xy[1],
+                sine * relative_xy[0] + cosine * relative_xy[1],
+            ]
+        )
+        camera_position = np.array(
+            [target[0] + rotated_xy[0], target[1] + rotated_xy[1], current_camera[2] + elevation_delta]
+        )
+        # 第一帧的相机已经处于粗预抓取安全位；局部补看保持它的已验证朝向，
+        # 只产生小视差。否则一次 look-at 重定向会因手眼横向偏置被放大为远大于
+        # 相机平移量的手掌摆动，违背局部观察的约束。
+        camera_rotation = (
+            np.asarray(current_camera_rotation_base, dtype=np.float64)
+            if current_camera_rotation_base is not None
+            else camera_look_at_rotation(camera_position, target)
+        )
+        sight_vectors = camera_position[None, :] - centers
+        sight_vectors /= np.linalg.norm(sight_vectors, axis=1, keepdims=True)
+        visibility = np.clip((normals * sight_vectors).sum(axis=1), 0.0, 1.0)
+        visible = tuple(int(item) for item in np.flatnonzero(visibility >= 0.20))
+        camera_from_base = np.eye(4)
+        camera_from_base[:3, :3] = camera_rotation
+        camera_from_base[:3, 3] = camera_position
+        hand_from_base = camera_from_base @ camera_from_hand
+        views.append(
+            ObservationView(
+                view_id=f"local_{view_id}",
+                camera_position_base_m=camera_position,
+                camera_orientation_base_xyzw=matrix_to_quaternion(camera_rotation),
+                hand_position_base_m=hand_from_base[:3, 3],
+                hand_orientation_base_xyzw=matrix_to_quaternion(hand_from_base[:3, :3]),
+                expected_contact_visibility=float(visibility.mean()),
+                visible_contact_indices=visible,
+            )
+        )
+    return sorted(views, key=lambda view: (-view.expected_contact_visibility, view.view_id))

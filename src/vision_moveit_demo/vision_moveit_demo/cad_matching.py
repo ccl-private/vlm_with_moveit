@@ -958,16 +958,17 @@ class MugHandleCadMatcher:
         self,
         model: CadModel,
         observations: list[tuple[SegmentationResult, UnifiedCameraFrame]],
-        *,
-        yaw_prior_rad: float | None = None,
     ) -> CadPoseEstimate:
-        """将多个已标定腕部 RGB-D 帧均衡采样后在基座系联合精配准。
+        """将多个已标定的腕部 RGB-D 帧在基座系联合精配准。
 
-        每帧独立限采样，避免近距离视角因像素更密而淹没其它方向；多视角路径
-        不使用固定相机的经验 yaw 偏置。运行时不读取对象真值。
+        固定相机只负责发现、粗 ROI 和安全接近；它不进入这个最终抓取 pose 的
+        点云融合，也不作为 yaw 先验。每帧独立限采样，避免近距离视角因像素
+        更密而淹没其它方向。运行时不读取对象真值。
         """
         if len(observations) < 2:
             raise ValueError("马克杯多视角精配准至少需要两帧 RGB-D 观测")
+        if any(frame.name != "camera_wrist" for _, frame, *_ in observations):
+            raise ValueError("马克杯最终多视角 pose 只能由腕部 RGB-D 观测生成")
         clouds = []
         confidences = []
         visibility_weights = []
@@ -1084,63 +1085,14 @@ class MugHandleCadMatcher:
             default=0.0,
         )
         support_margin = float(support - alternative_support)
-        used_yaw_prior_recovery = False
-        if yaw_prior_rad is not None:
-            # 弱腕部证据下，完整搜索可能落在杯身边缘的错误局部极值。固定相机
-            # 粗 pose 是另一条独立观测：用它的 yaw 再做一次完整 CAD 平移细化，
-            # 并要求把手区仍有最小可见支持。只有腕部存在强且明确的反证时，才
-            # 允许它推翻粗候选；否则采用“粗候选被腕部复核”的后验 pose。
-            prior_yaw = float(np.arctan2(np.sin(yaw_prior_rad), np.cos(yaw_prior_rad)))
-            prior_rotation = self._rotation_z(prior_yaw)
-            _, prior_mesh_center, _ = mesh_matcher._fit_translation(
-                all_points,
-                local_surface,
-                prior_yaw,
-                body_center + prior_rotation @ mesh_center_object,
-            )
-            prior_center = prior_mesh_center - prior_rotation @ mesh_center_object
-            prior_support, _, prior_view = self._critical_region_evidence(
-                clouds, critical_vertices, prior_center, prior_yaw, view_weights=view_weights
-            )
-            prior_alternative = max(
-                (
-                    self._critical_region_evidence(
-                        clouds, critical_vertices, prior_center, float(candidate_yaw), view_weights=view_weights
-                    )[0]
-                    for candidate_yaw in np.linspace(-np.pi, np.pi, 72, endpoint=False)
-                    if self._yaw_distance(float(candidate_yaw), prior_yaw) >= 0.35
-                ),
-                default=0.0,
-            )
-            prior_margin = float(prior_support - prior_alternative)
-            strong_wrist_override = support >= prior_support + 0.15 and support_margin >= 0.15
-            if prior_support >= 0.035 and not strong_wrist_override:
-                yaw_rad = prior_yaw
-                rotation = prior_rotation
-                center = prior_center
-                support = prior_support
-                support_margin = prior_margin
-                evidence_view = prior_view
-                used_yaw_prior_recovery = True
-        if yaw_prior_rad is not None:
-            prior_distance = self._yaw_distance(yaw_rad, float(yaw_prior_rad))
-            # 固定相机的粗 pose 不是最终抓取答案，却仍是一项独立几何证据。
-            # 当多视角候选与它相差 43° 以上、但关键区本身又没有强覆盖/强差距
-            # 时，不允许一次偶然的局部贴合把姿态翻到另一个大范围 yaw 假设。
-            # 这相当于工业系统的 pose-hypothesis gate；真正清晰的腕部观测仍可
-            # 以更高的覆盖率和 margin 推翻粗先验。
-            if prior_distance > 0.75 and (support < 0.25 or support_margin < 0.15):
-                raise RuntimeError(
-                    "马克杯多视角 yaw 与固定相机粗候选严重分歧且关键区证据不足："
-                    f"分歧={np.rad2deg(prior_distance):.1f}°，覆盖率={support:.3f}，"
-                    f"替代朝向差值={support_margin:.3f}"
-                )
-        # 这是“已标注夹持区在最佳预期视角中的有效可见比例”。没有独立粗
-        # 候选时保持严格的 8% / 6% 门槛；若最终 yaw 与固定相机粗候选相近，
-        # 两路几何证据可共同支撑被部分遮挡的把手，门槛降为 4% / 2.5%。无论
-        # 哪种情况，末端仍必须通过真实双侧接触，不能以视觉置信度代替接触。
-        support_requirement = 0.08 if yaw_prior_rad is None else 0.04
-        margin_requirement = 0.06 if yaw_prior_rad is None else 0.025
+        # 只有两条以上腕部基线都支持的 CAD 关键夹持区才能驱动最终姿态。固定
+        # 相机在此阶段完全不参与评分；不足就继续主动观察或安全拒绝，而非回退
+        # 到远距离粗姿态。物理双侧相对面接触仍是后续不可省略的最后门禁。
+        support_requirement = 0.08
+        # 两帧腕部时，6% 差值用于避免圆柱杯身的局部贴合伪装成把手；取得第三
+        # 条独立腕部基线后，多个方位都支持同一候选本身已是额外约束，可将差值
+        # 门槛收紧到仍可区分候选的 4%。这里完全不使用固定相机作为放行依据。
+        margin_requirement = 0.04 if len(observations) >= 3 else 0.06
         if support < support_requirement or support_margin < margin_requirement:
             raise RuntimeError(
                 "马克杯把手抓取关键区证据不足："
@@ -1153,14 +1105,9 @@ class MugHandleCadMatcher:
         inlier_ratio = float(np.mean(distances < 0.008))
         body_confidence = float(np.clip((1.0 - body_residual / 0.012) * min(1.0, inlier_ratio / 0.45), 0.0, 1.0))
         # support 已按主动观察可见性折减；0.24 是该有效覆盖率达到“充分”的
-        # 标尺。与固定相机粗候选一致时，粗--精两路独立证据共同构成后验置信度；
-        # 大角度分歧仍只能依赖腕部关键区，见上方 hypothesis gate。
+        # 标尺。最终置信度只来自腕部的杯身与关键夹持区几何证据。
         critical_confidence = float(np.clip(support / 0.24, 0.0, 1.0))
-        if yaw_prior_rad is None:
-            prior_confidence = 0.0
-        else:
-            prior_confidence = float(0.45 * max(0.0, 1.0 - self._yaw_distance(yaw_rad, float(yaw_prior_rad)) / 0.75))
-        geometry_confidence = float(min(body_confidence, max(critical_confidence, prior_confidence)))
+        geometry_confidence = float(min(body_confidence, critical_confidence))
         if body_residual > 0.012 or inlier_ratio < 0.35 or geometry_confidence < 0.38:
             raise RuntimeError(
                 f"马克杯多视角 CAD 配准置信度不足：杯身残差={body_residual:.4f}m，"
@@ -1181,11 +1128,7 @@ class MugHandleCadMatcher:
             axial_yaw_observable=True,
             cylinder_axis_base=np.array([0.0, 0.0, 1.0]),
             point_count=len(all_points),
-            matching_method=(
-                "mug_handle_multiview_coarse_yaw_prior_and_grasp_region_refinement"
-                if used_yaw_prior_recovery
-                else "mug_handle_multiview_grasp_region_surface_refinement"
-            ),
+            matching_method="mug_handle_wrist_multiview_grasp_region_surface_refinement",
             object_yaw_rad=yaw_rad,
             critical_region_support=support,
             critical_region_margin=support_margin,
@@ -1402,16 +1345,12 @@ class CadMatcherDispatcher:
         self,
         model: CadModel,
         observations: list[tuple[SegmentationResult, UnifiedCameraFrame]],
-        *,
-        yaw_prior_rad: float | None = None,
     ) -> CadPoseEstimate:
         matcher = self._matchers.get(model.geometry_type)
         if not isinstance(matcher, (GenericMeshCadMatcher, MugHandleCadMatcher)):
             raise ValueError(f"geometry_type={model.geometry_type} 尚未实现多视角 CAD 融合")
         if isinstance(matcher, MugHandleCadMatcher):
-            return matcher.match_multiview(model, observations, yaw_prior_rad=yaw_prior_rad)
-        if yaw_prior_rad is not None:
-            raise ValueError("通用 mesh 多视角匹配不接受 SKU 专用 yaw 粗先验")
+            return matcher.match_multiview(model, observations)
         return matcher.match_multiview(model, observations)
 
 

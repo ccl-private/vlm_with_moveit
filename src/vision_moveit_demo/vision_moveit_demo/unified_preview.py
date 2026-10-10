@@ -163,6 +163,10 @@ class VncOverlayViewer:
         self.scene = mujoco.MjvScene(simulation.model, maxgeom=2000)
         self.context = mujoco.MjrContext(simulation.model, mujoco.mjtFontScale.mjFONTSCALE_150)
         self.show_depth = False
+        self.editor_active = False
+        self._editor_confirmed = False
+        self._editor_selected_index = 0
+        self._editor_message = "按 E 进入场景编辑模式"
         self.video_recorders: tuple[_Mp4Recorder, _Mp4Recorder] | None = None
         if video_dir is not None:
             self.video_recorders = (
@@ -171,17 +175,74 @@ class VncOverlayViewer:
             )
             print(f"[视频] 正在保存两路 MP4：{video_dir / 'main.mp4'}、{video_dir / 'wrist.mp4'}", flush=True)
         glfw.set_key_callback(self.window, self._on_key)
-        print("[阶段 1] VNC 窗口已创建；正在渲染（D：深度，R：重置，Esc：退出）。", flush=True)
+        print("[阶段 1] VNC 窗口已创建；正在渲染（D：深度，R：重置，E：编辑，Esc：退出）。", flush=True)
 
     def _on_key(self, _window, key, _scancode, action, _mods) -> None:
         if action != self.glfw.PRESS:
+            return
+        if self.editor_active and self._handle_editor_key(key, _mods):
             return
         if key == self.glfw.KEY_D:
             self.show_depth = not self.show_depth
         elif key == self.glfw.KEY_R:
             self.simulation.reset()
+            self._editor_message = "场景已重置"
+        elif key == self.glfw.KEY_E:
+            self.editor_active = True
+            self._editor_confirmed = False
+            self._editor_message = "编辑模式：选择物体后用方向键移动，Enter 确认"
         elif key == self.glfw.KEY_ESCAPE:
             self.glfw.set_window_should_close(self.window, True)
+
+    def _handle_editor_key(self, key: int, mods: int) -> bool:
+        editable_objects = self.simulation.EDITABLE_OBJECTS
+        if key == self.glfw.KEY_N:
+            self._editor_selected_index = (self._editor_selected_index + 1) % len(editable_objects)
+            self._editor_message = f"已切换到 {editable_objects[self._editor_selected_index]}"
+            return True
+        if key == self.glfw.KEY_ENTER:
+            self._editor_confirmed = True
+            self.editor_active = False
+            self._editor_message = "编辑已确认；将从当前场景重新感知并规划"
+            return True
+        if key == self.glfw.KEY_E:
+            self.editor_active = False
+            self._editor_message = "已退出编辑模式；当前改动已保留"
+            return True
+        distance = 0.05 if mods & self.glfw.MOD_SHIFT else 0.01
+        delta_by_key = {
+            self.glfw.KEY_LEFT: (-distance, 0.0),
+            self.glfw.KEY_RIGHT: (distance, 0.0),
+            self.glfw.KEY_DOWN: (0.0, -distance),
+            self.glfw.KEY_UP: (0.0, distance),
+        }
+        selected_name = editable_objects[self._editor_selected_index]
+        if key in delta_by_key:
+            _accepted, self._editor_message = self.simulation.move_editable_object(
+                selected_name, delta_by_key[key]
+            )
+            return True
+        if key in (self.glfw.KEY_J, self.glfw.KEY_L):
+            yaw_delta = np.deg2rad(5.0 if key == self.glfw.KEY_J else -5.0)
+            _accepted, self._editor_message = self.simulation.move_editable_object(selected_name, (0.0, 0.0), yaw_delta)
+            return True
+        return False
+
+    def edit_before_task(self) -> bool:
+        """阻塞在任务前的编辑状态；Enter 确认，关闭窗口则取消本回合。"""
+        self.editor_active = True
+        self._editor_confirmed = False
+        self._editor_message = "编辑模式：N 切换物体，方向键移动，Shift 加速，J/L 旋转，Enter 开始任务"
+        while not self._editor_confirmed:
+            selected_name = self.simulation.EDITABLE_OBJECTS[self._editor_selected_index]
+            state = f"Scene edit: {selected_name} | {self._editor_message}"
+            if not self.render_once(state):
+                return False
+            # 编辑期间只刷新正运动学，不推进物理。否则物体会在用户还没确认时
+            # 因重力/接触求解发生微小漂移，且下一步 CAD 看到的不是所编辑的位置。
+            self.mujoco.mj_forward(self.simulation.model, self.simulation.data)
+            time.sleep(1.0 / 30.0)
+        return True
 
     def _draw_camera(self, image: np.ndarray, left: int, bottom: int, width: int, height: int, context) -> None:
         """将连续 RGB 图像上传到指定 viewport。"""
@@ -245,7 +306,7 @@ class VncOverlayViewer:
             viewport,
             "Panda Pick-and-Place",
             f"State: {task_state} | Fixed camera: top-right | Wrist: separate window\n"
-            f"Camera: {camera_mode} | D: depth  R: reset  Esc: stop",
+            f"Camera: {camera_mode} | D: depth  R: reset  E: edit  Esc: stop",
             self.context,
         )
         self.glfw.swap_buffers(self.window)
@@ -267,7 +328,10 @@ class VncOverlayViewer:
 
     def run(self) -> None:
         while self.render_once("Idle / home"):
-            self.simulation.hold_home(steps=1)
+            if self.editor_active:
+                self.mujoco.mj_forward(self.simulation.model, self.simulation.data)
+            else:
+                self.simulation.hold_home(steps=1)
             time.sleep(1.0 / 30.0)
         self.close()
 

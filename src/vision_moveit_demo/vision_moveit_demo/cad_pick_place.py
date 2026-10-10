@@ -23,7 +23,11 @@ from .cad_matching import (
     RuleVlmAdapter,
     grasp_pose_candidates,
 )
-from .active_perception import generate_observation_views
+from .active_perception import (
+    ObservationView,
+    generate_local_observation_views,
+    generate_observation_views,
+)
 from .stage2_executor import MujocoTaskExecutor
 from .truth_baseline import MoveItTrajectoryClient, _execute_trajectory
 from .unified_scene import UnifiedPandaCupSimulation
@@ -163,12 +167,97 @@ def _yaw_distance_rad(first: float | None, second: float | None) -> float:
     return float(abs(np.arctan2(np.sin(first - second), np.cos(first - second))))
 
 
+def _rank_wrist_observation_views(
+    views: list[ObservationView],
+    selected_camera_positions: list[np.ndarray],
+    covered_contact_indices: set[int],
+    current_hand_position: np.ndarray,
+) -> list[ObservationView]:
+    """按预期新增夹持区、相机基线和运动代价选择下一次腕部观察。
+
+    第一帧优先直接看到更多 CAD 接触面；后续帧优先补充尚未覆盖的面并扩大相机
+    基线。固定相机的 yaw 不参与该排序，因此即使粗朝向错了，也不会让腕部沿着
+    一个错误把手方向来回观察。
+    """
+    def score(view: ObservationView) -> tuple[float, float, float, float, str]:
+        new_contacts = len(set(view.visible_contact_indices) - covered_contact_indices)
+        if selected_camera_positions:
+            baseline_m = min(
+                float(np.linalg.norm(view.camera_position_base_m - previous))
+                for previous in selected_camera_positions
+            )
+        else:
+            baseline_m = 0.0
+        hand_travel_m = float(np.linalg.norm(view.hand_position_base_m - current_hand_position))
+        # 当两片接触面都已由不同方位覆盖时，优先选更可能看清把手的同位不同
+        # 腕部滚转，去除夹爪/前臂遮挡；不能为了凑第三条几何基线跑到一个预测
+        # 可见性接近零的方位。仍将基线作为同等可见性候选间的次级排序项。
+        return (-float(new_contacts), -view.expected_contact_visibility, -baseline_m, hand_travel_m, view.view_id)
+
+    return sorted(views, key=score)
+
+
+def _trajectory_endpoint_joint_positions(trajectory, fallback: dict[str, float]) -> dict[str, float]:
+    """提取 MoveIt 轨迹终点，供不执行动作的下一段可达性预检使用。"""
+    positions = dict(fallback)
+    points = list(trajectory.joint_trajectory.points)
+    if not points:
+        raise RuntimeError("MoveIt 预检轨迹没有关节路点")
+    for name, value in zip(trajectory.joint_trajectory.joint_names, points[-1].positions):
+        if name.startswith("panda_joint"):
+            positions[name.replace("panda_", "")] = float(value)
+    return positions
+
+
+def _validate_full_grasp_path(
+    client: MoveItTrajectoryClient,
+    executor: MujocoTaskExecutor,
+    catalog: ObjectCatalog,
+    target_object_id: str,
+    moveit_pregrasp: np.ndarray,
+    moveit_grasp: np.ndarray,
+    orientation_xyzw: np.ndarray,
+) -> None:
+    """预检从当前状态到预抓取、再到最终接近的完整 MoveIt 可达性。
+
+    只验证，不执行。第二段规划临时向 MoveIt 发布第一段轨迹的末端关节状态，
+    再立即恢复 MuJoCo 的真实当前状态和预抓取碰撞场景。这样 ``GOAL_STATE_INVALID``
+    不会被误报为“闭爪未形成双侧接触”。
+    """
+    current_joint_positions = executor.joint_positions()
+    client.publish_task_scene(
+        catalog.fixture_collision_positions(), target_object_id, PlanningPhase.PREGRASP
+    )
+    client.publish_joint_state(current_joint_positions)
+    time.sleep(0.25)
+    try:
+        pregrasp_trajectory = client.request(moveit_pregrasp, orientation_xyzw)
+        endpoint_positions = _trajectory_endpoint_joint_positions(pregrasp_trajectory, current_joint_positions)
+        client.publish_task_scene(
+            catalog.fixture_collision_positions(), target_object_id, PlanningPhase.APPROACH
+        )
+        client.publish_joint_state(endpoint_positions)
+        time.sleep(0.25)
+        client.request(moveit_grasp, orientation_xyzw)
+    finally:
+        client.publish_task_scene(
+            catalog.fixture_collision_positions(), target_object_id, PlanningPhase.PREGRASP
+        )
+        client.publish_joint_state(current_joint_positions)
+        time.sleep(0.25)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="阶段 3：语义选模 CAD 匹配抓取基线")
     parser.add_argument("--instruction", default="抓取红色杯子并放到托盘")
     parser.add_argument("--root", type=Path, default=Path(os.environ["MOVEIT_EXPERIMENT_ROOT"]))
     parser.add_argument("--vnc", action="store_true", help="在 VNC 中显示 CAD 匹配驱动的执行过程。")
     parser.add_argument("--video-dir", type=Path, help="保存 VNC 主视角和腕部相机 MP4 的目录。")
+    parser.add_argument(
+        "--interactive-edit",
+        action="store_true",
+        help="任务开始前进入场景编辑：在 VNC 中移动工件，按 Enter 后从新位置重新感知和规划。",
+    )
     parser.add_argument(
         "--force-matcher-type",
         choices=("mesh",),
@@ -183,7 +272,7 @@ def main() -> None:
         "--max-wrist-observations",
         type=int,
         default=3,
-        help="主动观察最多执行的腕部视角数；on_path 最多使用 2 帧，sweep 使用该值，默认 3。",
+        help="主动观察最多执行的腕部视角数；on_path 在两帧成功后立即融合，证据不足时最多补到 3 帧，默认 3。",
     )
     parser.add_argument(
         "--active-observation-mode",
@@ -205,6 +294,8 @@ def main() -> None:
     arguments = parser.parse_args()
     if arguments.max_wrist_observations <= 0:
         raise ValueError("--max-wrist-observations 必须为正数")
+    if arguments.interactive_edit and not arguments.vnc:
+        raise ValueError("--interactive-edit 需要 --vnc，因为它通过 VNC 主窗口接收键盘输入")
 
     simulation = UnifiedPandaCupSimulation(arguments.root, create_renderers=False)
     viewer = None
@@ -226,6 +317,12 @@ def main() -> None:
         render_frame = None
 
     try:
+        if arguments.interactive_edit:
+            assert viewer is not None
+            print("[场景编辑] 请在 VNC 主窗口完成编辑，按 Enter 后才会开始本轮感知和规划。", flush=True)
+            if not viewer.edit_before_task():
+                print("[场景编辑] 窗口已关闭；未启动任务。", flush=True)
+                return
         intent = RuleVlmAdapter().infer(arguments.instruction)
         catalog = ObjectCatalog(arguments.root)
         model = catalog.find(intent)
@@ -255,8 +352,9 @@ def main() -> None:
             f"yaw={pose.object_yaw_rad!r}，方法={pose.matching_method}",
             flush=True,
         )
-        # on_path 模式始终以固定相机结果作为腕部局部匹配的先验，不会把任何
-        # MuJoCo 物体真值带入控制回路。
+        # 固定相机 pose 只用于建立主动观察的粗 ROI、接近走廊和视角候选；最终
+        # 抓取 pose 必须由腕部 RGB-D 多视角给出，不会把任何 MuJoCo 物体真值
+        # 带入控制回路。
         coarse_pose = pose
         # 正常档以仿真时间一倍速运行；VNC 只显示该节拍，不通过渲染 sleep 改变它。
         executor = MujocoTaskExecutor(
@@ -446,7 +544,6 @@ def main() -> None:
                             else (item[1], item[2])
                             for item in matched_observations
                         ],
-                        yaw_prior_rad=pose.object_yaw_rad if model.geometry_type == "mug_handle" else None,
                     )
                     if pose.object_yaw_rad is None:
                         active_observation["failure_reason"] = "fused_yaw_unobservable"
@@ -629,57 +726,71 @@ def main() -> None:
             _execute_trajectory(executor, pregrasp_trajectory)
             executor._event("moveit_pregrasp_complete")
             if arguments.active_observation and arguments.active_observation_mode == "on_path":
-                # 不再先做环绕扫描：粗预抓取本来就是必经安全走廊。到达后直接用
-                # 腕部 RGB-D 做局部校正；相机必须主动注视把手，而不能假定抓取
-                # 姿态下腕部光轴天然朝向目标。若关键区证据不足，最多换一个侧面。
-                # 每次移动都从当前关节状态重新由 MoveIt 规划，不能在线篡改已批准
-                # 的 IK 轨迹。
+                # 不再先做大范围环绕扫描：粗预抓取本来就是必经安全走廊。到达后
+                # 直接用腕部 RGB-D 做局部闭环；固定相机仅提供本段安全走廊和深度
+                # ROI 的粗中心，不进入最终 pose 融合或 yaw 裁决。相机必须主动
+                # 注视把手，而不能假定抓取姿态下腕部光轴天然朝向目标。每次移动
+                # 都从当前关节状态重新由 MoveIt 规划，不能在线篡改已批准的 IK
+                # 轨迹。
                 local_observations: list[tuple[object, object, float]] = []
                 refined_pose = None
                 local_failure = None
                 wrist_frame = simulation.cameras(("wrist",))["wrist"]
                 hand_from_camera = np.linalg.inv(_base_from_body(simulation, "hand")) @ wrist_frame.base_from_camera
                 contact_centers, contact_normals = _contact_geometry_base(coarse_pose, (template,))
-                # 使用已在本场景验证可达的 26 cm 半径、30 cm 高度俯视位：相机
-                # 会停在粗预抓取旁约 20 cm 的安全走廊，而不是贴近桌面进入腕部
-                # 奇异/跟踪裕量不足的区域。排序优先把手可见性，再看当前手掌的
-                # 位移距离。
-                on_path_views = generate_observation_views(
-                    coarse_pose.position_base_m,
-                    contact_centers,
-                    contact_normals,
-                    hand_from_camera,
-                    radius_m=0.26,
-                    elevation_m=0.30,
-                )
-                # 观察位必须仍处于粗预抓取末端的局部工作空间。这个上限不是
-                # MoveIt 的碰撞约束替代品，而是防止“为了看一眼”选到桌子另一侧
-                # 的可达解；没有合格近视角时宁可安全拒绝，再由 sweep 诊断模式
-                # 排障，也不把默认执行退化成大绕行。
-                maximum_observation_hand_travel_m = 0.25
+                # 观察从粗预抓取附近开始；每一轮候选都以当前腕相机为中心，只作
+                # 厘米级移动。这样“补看”是局部视觉伺服，而不是为了凑基线绕到
+                # 桌子的另一侧。
+                maximum_observation_hand_travel_m = 0.055
                 selected_camera_positions: list[np.ndarray] = []
-                for observation_index in range(min(2, arguments.max_wrist_observations)):
+                covered_contact_indices: set[int] = set()
+                maximum_wrist_observations = min(3, arguments.max_wrist_observations)
+                for observation_index in range(maximum_wrist_observations):
                     current_hand_position = executor.body_position("hand")
+                    current_wrist_frame = simulation.cameras(("wrist",))["wrist"]
+                    local_views = generate_local_observation_views(
+                        coarse_pose.position_base_m,
+                        contact_centers,
+                        contact_normals,
+                        current_wrist_frame.base_from_camera[:3, 3],
+                        hand_from_camera,
+                        current_wrist_frame.base_from_camera[:3, :3],
+                    )
                     observation_view = None
                     observation_trajectory = None
                     observation_hand_travel_m = None
-                    for candidate_view in sorted(
-                        on_path_views,
-                        key=lambda view: (
-                            -view.expected_contact_visibility,
-                            float(np.linalg.norm(view.hand_position_base_m - current_hand_position)),
-                        ),
-                    ):
-                        if any(
-                            np.linalg.norm(candidate_view.camera_position_base_m - previous) < 0.06
+                    ranked_local_views = _rank_wrist_observation_views(
+                        local_views,
+                        selected_camera_positions,
+                        covered_contact_indices,
+                        current_hand_position,
+                    )
+                    # 粗预抓取位本身就是第一条安全近距观察位。先原地采一帧，
+                    # 后续帧才在它附近制造小视差；不能把第一帧也变成大幅重定向。
+                    if observation_index == 0:
+                        ranked_local_views = sorted(
+                            ranked_local_views,
+                            key=lambda view: (view.view_id != "local_hold", view.view_id),
+                        )
+                    for candidate_view in ranked_local_views:
+                        same_camera_position = any(
+                            np.linalg.norm(candidate_view.camera_position_base_m - previous) < 0.006
                             for previous in selected_camera_positions
-                        ):
+                        )
+                        # 前两帧必须建立真实的空间基线；若它们仍不能分辨把手，
+                        # 第三帧允许同一相机位置的另一腕部滚转来解除机器人自身
+                        # 遮挡，而不是强行跑向低可见性方位。
+                        if same_camera_position and observation_index < 2:
                             continue
                         candidate_hand_travel_m = float(
                             np.linalg.norm(candidate_view.hand_position_base_m - current_hand_position)
                         )
                         if candidate_hand_travel_m > maximum_observation_hand_travel_m:
                             continue
+                        if candidate_hand_travel_m < 0.002:
+                            observation_view = candidate_view
+                            observation_hand_travel_m = candidate_hand_travel_m
+                            break
                         client.publish_joint_state(executor.joint_positions())
                         time.sleep(0.25)
                         try:
@@ -692,12 +803,13 @@ def main() -> None:
                         observation_view = candidate_view
                         observation_hand_travel_m = candidate_hand_travel_m
                         break
-                    if observation_view is None or observation_trajectory is None:
+                    if observation_view is None:
                         raise RuntimeError("on_path_reobserve_exhausted：没有可达的近距把手观察位")
                     executor.set_display_state(f"On-path wrist observation {observation_index + 1}")
                     # 观察位会有明显的腕部转向；采用低于常规 1.7 倍的温和加速，
                     # 在保持跟踪裕量的同时避免为一次局部观测等待完整原始轨迹时长。
-                    _execute_trajectory(executor, observation_trajectory, speed_scale=1.25)
+                    if observation_trajectory is not None:
+                        _execute_trajectory(executor, observation_trajectory, speed_scale=1.25)
                     executor._event(
                         "on_path_wrist_observation_complete",
                         view_id=observation_view.view_id,
@@ -705,6 +817,7 @@ def main() -> None:
                         hand_travel_m=observation_hand_travel_m,
                     )
                     selected_camera_positions.append(observation_view.camera_position_base_m)
+                    covered_contact_indices.update(observation_view.visible_contact_indices)
                     wrist_frame = simulation.cameras(("wrist",))["wrist"]
                     lateral_radius = 0.5 * float(np.linalg.norm(model.dimensions_m[:2])) + 0.025
                     wrist_segmentation = ColorThresholdSegmenter().segment(
@@ -722,6 +835,12 @@ def main() -> None:
                         "expected_contact_visibility": observation_view.expected_contact_visibility,
                         "hand_travel_m": observation_hand_travel_m,
                         "pixel_count": wrist_segmentation.pixel_count,
+                        # 分割面积越充分，越值得在多视角几何融合中占更高权重；这
+                        # 是实时画面质量，而不是固定相机粗 pose 的置信度。
+                        "fusion_weight": float(
+                            observation_view.expected_contact_visibility
+                            * (0.35 + 0.65 * wrist_segmentation.confidence)
+                        ),
                         "contributes_new_camera_baseline": True,
                     }
                     if observation_debug_dir is not None:
@@ -737,44 +856,80 @@ def main() -> None:
                         )
                         entry["debug_observation"] = str(debug_path)
                     local_observations.append(
-                        (wrist_segmentation, wrist_frame, observation_view.expected_contact_visibility)
+                        (wrist_segmentation, wrist_frame, float(entry["fusion_weight"]))
                     )
+                    if len(local_observations) < 2:
+                        entry.update(status="collected_for_wrist_fusion")
+                        active_observation["views"].append(entry)
+                        print(
+                            "[路径内腕部校正] 已采集第 1 帧；固定相机不参与最终 pose，"
+                            "继续选择互补腕部视角。",
+                            flush=True,
+                        )
+                        continue
                     try:
                         if model.geometry_type in {"mesh", "mug_handle"}:
-                            # 固定相机只提供低权重粗先验；最终把手证据来自近距腕部
-                            # 帧。它使首个腕部停靠位即可形成几何基线，避免环绕扫描。
+                            # 两帧及以上腕部 RGB-D 是最终 CAD pose 的唯一来源；
+                            # 固定相机的粗结果不会作为观察、yaw 或置信度的投票者。
                             matching_observations = (
-                                [(segmentation, fixed_frame, 0.15)] + local_observations
+                                local_observations
                                 if model.geometry_type == "mug_handle"
-                                else [(segmentation, fixed_frame)] + [item[:2] for item in local_observations]
+                                else [item[:2] for item in local_observations]
                             )
                             refined_pose = matcher_dispatcher.match_multiview(
                                 model,
                                 matching_observations,
-                                yaw_prior_rad=coarse_pose.object_yaw_rad
-                                if model.geometry_type == "mug_handle"
-                                else None,
                             )
                         else:
                             refined_pose = matcher_dispatcher.match(model, wrist_segmentation, wrist_frame)
+                        refined_candidates = grasp_pose_candidates(refined_pose, (template,))
+                        if not refined_candidates:
+                            raise RuntimeError("refined_grasp_missing：腕部 pose 未生成当前 CAD 抓取框")
+                        _, candidate_grasp_position, candidate_orientation = refined_candidates[0]
+                        candidate_grasp_position = candidate_grasp_position + reachability_offset
+                        candidate_tcp_offset = _rotate_vector_by_quaternion(
+                            np.array([0.0, 0.0, -0.082]), candidate_orientation
+                        )
+                        candidate_moveit_grasp = candidate_grasp_position + candidate_tcp_offset
+                        candidate_moveit_pregrasp = (
+                            candidate_grasp_position
+                            + np.array([0.005, 0.0, template.approach_clearance_m])
+                            + candidate_tcp_offset
+                        )
+                        # 接受 pose 前先预检“当前状态→预抓取→最终接近”。规划
+                        # 不可达属于候选/工作空间问题，不能冒充夹爪接触失败。
+                        _validate_full_grasp_path(
+                            client,
+                            executor,
+                            catalog,
+                            target_object_id,
+                            candidate_moveit_pregrasp,
+                            candidate_moveit_grasp,
+                            candidate_orientation,
+                        )
                         entry.update(
-                            status="matched",
+                            status="matched_and_reachable",
                             geometry_confidence=refined_pose.geometry_confidence,
                             matching_method=refined_pose.matching_method,
+                            full_grasp_path="pregrasp_and_approach_validated",
                         )
                         active_observation["views"].append(entry)
                         break
-                    except RuntimeError as error:
+                    except (RuntimeError, TimeoutError) as error:
                         local_failure = str(error)
-                        entry.update(status="insufficient_evidence", reason=local_failure)
+                        entry.update(
+                            status="goal_unreachable" if isinstance(error, TimeoutError) else "requires_local_reobserve",
+                            reason=local_failure,
+                        )
                         active_observation["views"].append(entry)
-                        if observation_index + 1 >= min(2, arguments.max_wrist_observations):
+                        if observation_index + 1 >= maximum_wrist_observations:
                             raise RuntimeError(
-                                f"on_path_reobserve_exhausted：近距腕部校正仍缺少抓取证据：{local_failure}"
+                                "on_path_reobserve_exhausted：近距腕部校正未获得可达且一致的抓取 pose："
+                                f"{local_failure}"
                             ) from error
                         print(
-                            f"[路径内腕部校正] 第 {observation_index + 1} 帧关键区证据不足，"
-                            "只尝试一个不同侧面的近距观察位。",
+                            f"[路径内腕部校正] 第 {observation_index + 1} 帧未获得可执行抓取 pose，"
+                            "仅小幅移动腕部到下一局部观察位后重试。",
                             flush=True,
                         )
                 if refined_pose is None:
@@ -782,8 +937,8 @@ def main() -> None:
                 pose = refined_pose
                 segmentation = local_observations[-1][0]
                 active_observation.update(
-                    selected_source="on_path:fixed_plus_wrist",
-                    consensus_count=len(local_observations) + 1,
+                    selected_source="on_path:wrist_multiview",
+                    consensus_count=len(local_observations),
                     fused_support_count=len(local_observations),
                     critical_region_support=pose.critical_region_support,
                     critical_region_margin=pose.critical_region_margin,
@@ -812,6 +967,104 @@ def main() -> None:
                 time.sleep(0.25)
                 executor.set_display_state("On-path corrected pregrasp / MoveIt")
                 _execute_trajectory(executor, client.request(moveit_pregrasp, grasp_orientation))
+                # 最后 10 cm 不盲从刚才的静态 plan：在已校正的预抓取位读取新的
+                # 腕部 RGB-D，若它与前两帧腕部融合后的 pose 只存在小幅、可信的
+                # 漂移，就以该测量重新生成末段目标。大跳变不以固定相机兜底，而
+                # 是保留已通过多腕部视角验证的 pose，避免单帧噪声突然扭转夹爪。
+                servo_entry: dict[str, object] = {"view_id": "on_path_servo_checkpoint"}
+                try:
+                    servo_frame = simulation.cameras(("wrist",))["wrist"]
+                    lateral_radius = 0.5 * float(np.linalg.norm(model.dimensions_m[:2])) + 0.025
+                    servo_segmentation = ColorThresholdSegmenter().segment(
+                        servo_frame.rgb,
+                        intent,
+                        frame=servo_frame,
+                        expected_position_base_m=pose.position_base_m,
+                        lateral_radius_m=lateral_radius,
+                        z_min_m=float(pose.position_base_m[2] - model.height_m / 2.0 + 0.004),
+                        z_max_m=float(pose.position_base_m[2] + model.height_m / 2.0 + 0.025),
+                    )
+                    servo_entry.update(
+                        camera_position_base_m=servo_frame.base_from_camera[:3, 3].tolist(),
+                        pixel_count=servo_segmentation.pixel_count,
+                        fusion_weight=float(0.35 + 0.65 * servo_segmentation.confidence),
+                    )
+                    if model.geometry_type == "mug_handle":
+                        servo_pose = matcher_dispatcher.match_multiview(
+                            model,
+                            local_observations
+                            + [(servo_segmentation, servo_frame, float(servo_entry["fusion_weight"]))],
+                        )
+                    elif model.geometry_type == "mesh":
+                        servo_pose = matcher_dispatcher.match_multiview(
+                            model,
+                            [item[:2] for item in local_observations] + [(servo_segmentation, servo_frame)],
+                        )
+                    else:
+                        servo_pose = matcher_dispatcher.match(model, servo_segmentation, servo_frame)
+                    position_delta_m = float(np.linalg.norm(servo_pose.position_base_m - pose.position_base_m))
+                    yaw_delta_rad = _yaw_distance_rad(servo_pose.object_yaw_rad, pose.object_yaw_rad)
+                    servo_entry.update(
+                        candidate_position_delta_m=position_delta_m,
+                        candidate_yaw_delta_rad=yaw_delta_rad,
+                        geometry_confidence=servo_pose.geometry_confidence,
+                    )
+                    # 这是最后一帧、单个观测的微调关口，不应把多视角融合后的
+                    # 可达抓取姿态改成另一个实质不同的候选。较大的差异应由前面
+                    # 的局部 NBV 重观测解决；这里仅允许传感器级的小漂移。
+                    if position_delta_m > 0.003 or yaw_delta_rad > np.deg2rad(3.0):
+                        servo_entry.update(
+                            status="rejected_large_delta",
+                            reason="末段单帧超出 3mm/3deg 微调范围，保持已验证的腕部多视角结果",
+                        )
+                    else:
+                        refined_candidates = grasp_pose_candidates(servo_pose, (template,))
+                        if not refined_candidates:
+                            raise RuntimeError("腕部末段校正后未生成原 CAD 抓取框")
+                        candidate_template, refined_grasp_position, candidate_orientation = refined_candidates[0]
+                        candidate_grasp_position = refined_grasp_position + reachability_offset
+                        candidate_tcp_offset = _rotate_vector_by_quaternion(
+                            np.array([0.0, 0.0, -0.082]), candidate_orientation
+                        )
+                        candidate_moveit_grasp = candidate_grasp_position + candidate_tcp_offset
+                        candidate_moveit_pregrasp = (
+                            candidate_grasp_position
+                            + np.array([0.005, 0.0, candidate_template.approach_clearance_m])
+                            + candidate_tcp_offset
+                        )
+                        # 微调虽小，也必须重新验证完整接近段；不可达时仍保留前面
+                        # 已验证的融合 pose，而不把规划问题混同为物理夹取失败。
+                        _validate_full_grasp_path(
+                            client,
+                            executor,
+                            catalog,
+                            target_object_id,
+                            candidate_moveit_pregrasp,
+                            candidate_moveit_grasp,
+                            candidate_orientation,
+                        )
+                        pose = servo_pose
+                        template = candidate_template
+                        grasp_orientation = candidate_orientation
+                        grasp_position = candidate_grasp_position
+                        tcp_offset = candidate_tcp_offset
+                        servo_entry.update(status="accepted", matching_method=servo_pose.matching_method)
+                        active_observation["selected_source"] = "on_path:wrist_multiview+servo_checkpoint"
+                        active_observation["fused_pose"] = {
+                            "position_base_m": pose.position_base_m.tolist(),
+                            "object_yaw_rad": pose.object_yaw_rad,
+                            "geometry_confidence": pose.geometry_confidence,
+                            "surface_residual_m": pose.surface_residual_m,
+                            "point_count": pose.point_count,
+                        }
+                        executor._event(
+                            "on_path_visual_servo_correction_complete",
+                            correction_position_m=position_delta_m,
+                            correction_yaw_rad=yaw_delta_rad,
+                        )
+                except (RuntimeError, TimeoutError) as error:
+                    servo_entry.update(status="unavailable", reason=str(error))
+                active_observation["views"].append(servo_entry)
                 executor._event(
                     "on_path_pose_correction_complete",
                     correction_position_m=(pose.position_base_m - coarse_pose.position_base_m).tolist(),
@@ -841,20 +1094,14 @@ def main() -> None:
             grasp_confirmed = False
             # 视觉 pose 的末端不确定度会集中放大到细把手的接触条上。对该类
             # 抓取，成熟产线会在 CAD 局部接触面附近进行受限的力/接触验证搜索，
-            # 而不是把第一次闭合失败直接解释为“视觉可以任意猜”。偏移均不超过
-            # 4 mm，且仅沿已标注的夹爪闭合轴和把手径向轴；每一次都必须通过同一
-            # 对真实碰撞面的双侧接触门禁。
+            # 而不是把第一次闭合失败直接解释为“视觉可以任意猜”。腕部重观测后
+            # 仍可能留下约 1 cm 横向误差，故沿夹爪闭合轴覆盖 ±12 mm、沿把手
+            # 径向覆盖 ±4 mm；每一次都必须通过同一对真实碰撞面的双侧接触门禁。
             if target_object_id == "yellow_mug":
-                grasp_search_offsets_object = (
-                    np.array([0.0, 0.0, 0.0]),
-                    np.array([0.0, 0.004, 0.0]),
-                    np.array([-0.004, 0.004, 0.0]),
-                    np.array([-0.004, 0.0, 0.0]),
-                    np.array([0.004, 0.004, 0.0]),
-                    np.array([0.0, -0.004, 0.0]),
-                    np.array([0.004, 0.0, 0.0]),
-                    np.array([-0.004, -0.004, 0.0]),
-                    np.array([0.004, -0.004, 0.0]),
+                grasp_search_offsets_object = tuple(
+                    np.array([closing_offset, radial_offset, 0.0])
+                    for closing_offset in (0.0, -0.006, 0.006, -0.012, 0.012)
+                    for radial_offset in (0.0, 0.004, -0.004)
                 )
             else:
                 grasp_search_offsets_object = (np.zeros(3),)
@@ -873,27 +1120,32 @@ def main() -> None:
                     try:
                         retry_pregrasp = client.request(
                             attempt_moveit_pregrasp,
-                            candidate_orientation,
+                            grasp_orientation,
                         )
                         _execute_trajectory(executor, retry_pregrasp)
                     except TimeoutError as error:
-                        print(f"[抓取重试] 第 {attempt} 次预抓取规划失败：{error}", flush=True)
-                        continue
+                        executor._event(
+                            "goal_unreachable",
+                            stage="retry_pregrasp",
+                            attempt=attempt,
+                            reason=str(error),
+                        )
+                        raise RuntimeError(
+                            "goal_unreachable：接触微调的预抓取位不可达；"
+                            "这不是双侧接触失败，不继续枚举夹持偏移"
+                        ) from error
                     executor.set_display_state(f"CAD grasp retry {attempt}: approach")
                 time.sleep(0.5)
                 client.publish_joint_state(executor.joint_positions())
                 time.sleep(0.25)
+                approach_start_joint_positions = executor.joint_positions()
+                approach_trajectory = None
                 try:
                     # 抓取框定义了物体相对手爪的偏置。即使只要求末端位置到达，
                     # 自由的腕部姿态也会旋转这段偏置，令长方体在托盘外侧松开；
                     # 因此接近、抬升和放置全程保持 CAD 的完整抓取姿态。
-                    _execute_trajectory(
-                        executor,
-                        client.request(
-                            attempt_moveit_grasp_position,
-                            grasp_orientation,
-                        ),
-                    )
+                    approach_trajectory = client.request(attempt_moveit_grasp_position, grasp_orientation)
+                    _execute_trajectory(executor, approach_trajectory)
                     executor._event(
                         "moveit_approach_complete",
                         hand_x=float(executor.body_position("hand")[0]),
@@ -935,16 +1187,36 @@ def main() -> None:
                     moveit_grasp_position = attempt_moveit_grasp_position
                     grasp_confirmed = True
                     break
-                except (RuntimeError, TimeoutError) as error:
+                except TimeoutError as error:
+                    executor._event(
+                        "goal_unreachable",
+                        stage="approach",
+                        attempt=attempt,
+                        reason=str(error),
+                    )
+                    raise RuntimeError(
+                        "goal_unreachable：最终接近位不可达；"
+                        "这不是双侧接触失败，不继续枚举夹持偏移"
+                    ) from error
+                except RuntimeError as error:
                     if target_object_id not in {"magenta_block", "yellow_mug"} or attempt == max_grasp_attempts:
                         raise
+                    if approach_trajectory is not None:
+                        # 闭合失败后夹爪可能正与目标接触。先沿刚刚验证过的轨迹
+                        # 反向退出到安全预抓取构型，再为下一局部偏移重新规划；否则
+                        # MoveIt 会把接触中的当前构型判为无效起点并让所有重试超时。
+                        executor.set_gripper(opened=True)
+                        executor.set_display_state(f"CAD grasp retry {attempt}: safe retreat")
+                        _retreat_observation_trajectory(
+                            executor, approach_trajectory, approach_start_joint_positions
+                        )
                     print(
                         f"[抓取重试] 第 {attempt} 次未形成双侧接触；"
                         f"CAD 局部偏移=({offset_object[0]:.3f}, {offset_object[1]:.3f}, {offset_object[2]:.3f})m；原因={error}",
                         flush=True,
                     )
             if not grasp_confirmed:
-                raise RuntimeError("洋红色长方体在 12 次真实抓取重试后仍未形成双侧接触")
+                raise RuntimeError(f"{target_object_id} 在 {max_grasp_attempts} 次真实抓取重试后仍未形成双侧接触")
             if target_object_id == "magenta_block":
                 simulation.data.eq_active[simulation.model.equality("magenta_block_rest").id] = 0
                 import mujoco

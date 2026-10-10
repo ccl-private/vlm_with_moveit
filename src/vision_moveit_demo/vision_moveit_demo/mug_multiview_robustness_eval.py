@@ -1,8 +1,8 @@
 """保存的主动腕部观测的现实退化回归。
 
-本评测和控制路径严格分离：输入仅为一次真实执行前保存的 RGB-D、实例掩码、
-相机外参与由固定相机产生的粗 yaw；MuJoCo pose 只在最后计算误差，不传入
-分割、CAD 匹配或候选选择。
+本评测和控制路径严格分离：输入仅为一次真实执行前保存的腕部 RGB-D、实例
+掩码和相机外参；MuJoCo pose 只在最后计算误差，不传入分割、CAD 匹配或候选
+选择。固定相机不参与最终腕部多视角 pose。
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def _load_observations(directory: Path) -> list[tuple[SegmentationResult, Unifie
             source="saved_active_observation",
         )
         frame = UnifiedCameraFrame(
-            name=path.stem,
+            name="camera_wrist",
             rgb=data["rgb"],
             depth=data["depth"],
             intrinsic=data["intrinsic"],
@@ -61,12 +61,6 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260924)
     parser.add_argument("--truth-position-m", type=float, nargs=3, required=True, metavar=("X", "Y", "Z"))
     parser.add_argument("--truth-yaw-rad", type=float, required=True)
-    parser.add_argument(
-        "--yaw-prior-rad",
-        type=float,
-        required=True,
-        help="该回合固定相机粗匹配输出的 yaw；它是控制时已有的证据，不是 MuJoCo 真值。",
-    )
     parser.add_argument("--output", type=Path, default=Path("logs/robustness/mug_sku_multiview.json"))
     arguments = parser.parse_args()
     if arguments.trials <= 0:
@@ -81,7 +75,6 @@ def main() -> None:
     results: dict[str, object] = {
         "purpose": "离线评测；真值只用于误差统计，不作为匹配输入",
         "observation_dir": str(arguments.observation_dir),
-        "yaw_prior_rad": arguments.yaw_prior_rad,
         "grasp_ready_threshold": {"position_error_m": 0.008, "yaw_error_deg": 12.0},
         "profiles": {},
     }
@@ -93,7 +86,7 @@ def main() -> None:
                 degraded_frame, degraded_segmentation = _degrade_frame_and_mask(frame, segmentation, profile, generator)
                 observations.append((degraded_segmentation, degraded_frame, visibility))
             try:
-                pose = matcher.match_multiview(model, observations, yaw_prior_rad=arguments.yaw_prior_rad)
+                pose = matcher.match_multiview(model, observations)
                 position_error = float(np.linalg.norm(pose.position_base_m - truth_position))
                 yaw_error_deg = float(np.rad2deg(_yaw_error_rad(pose.object_yaw_rad, arguments.truth_yaw_rad)))
                 records.append(
