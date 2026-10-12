@@ -52,4 +52,11 @@ fi
   ros-jazzy-moveit-resources-panda-moveit-config ros-dev-tools \
   ros-jazzy-joint-state-broadcaster ros-jazzy-joint-trajectory-controller
 
+# Keep the Python vision dependency separate from the RoboStack package solve.
+# Open3D provides the tested FPFH/RANSAC/point-to-plane ICP implementation used
+# by the generic CAD surface matcher.
+"$MOVEIT_ENV_PREFIX/bin/python" -m pip install --disable-pip-version-check --requirement \
+  "$MOVEIT_EXPERIMENT_ROOT/requirements-vision.txt"
+"$MOVEIT_ENV_PREFIX/bin/python" -c 'import open3d; print("Open3D", open3d.__version__)'
+
 echo "Installed native MoveIt environment: $MOVEIT_ENV_PREFIX"

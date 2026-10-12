@@ -5,11 +5,12 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 
 import numpy as np
+import open3d as o3d
 
 from .unified_scene import UnifiedCameraFrame
 
@@ -319,6 +320,7 @@ class CadPoseEstimate:
     # 这两个字段由多视角关键区域匹配器填写；其余 matcher 保持 None。
     critical_region_support: float | None = None
     critical_region_margin: float | None = None
+    registration_diagnostics: dict[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -338,6 +340,48 @@ class CadPoseEstimate:
             "object_yaw_rad": self.object_yaw_rad,
             "critical_region_support": self.critical_region_support,
             "critical_region_margin": self.critical_region_margin,
+            "registration_diagnostics": self.registration_diagnostics,
+        }
+
+
+@dataclass(frozen=True)
+class GraspRoiEstimate:
+    """由抓取接触区得到的受限局部 pose 精修结果。
+
+    ``global_pose`` 只负责把机器人带进观察工作区；本结构中的 ``pose`` 是在
+    CAD 抓取标注的两片接触面都获得深度支持后才可用于闭爪的 pose。两者分开
+    记录，避免局部把手点云悄悄覆盖整体 CAD 匹配的审计信息。
+    """
+
+    pose: CadPoseEstimate
+    template_id: str
+    positive_support: float
+    negative_support: float
+    positive_residual_m: float
+    negative_residual_m: float
+    supporting_view_count: int
+    alternative_margin: float
+    translation_correction_m: float
+    rotation_correction_deg: float
+    selected_yaw_offset_rad: float
+    # 这些是与最终 pose 共用同一双接触面证据门槛的微小局部朝向。不包含任何
+    # 仅因 IK 可达却没有深度支持的候选；调用方可在这一小集合中联合选择可达
+    # 的夹爪姿态。
+    reachability_validated_yaw_offsets_rad: tuple[float, ...] = (0.0,)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "template_id": self.template_id,
+            "positive_surface_support": self.positive_support,
+            "negative_surface_support": self.negative_support,
+            "positive_surface_residual_m": self.positive_residual_m,
+            "negative_surface_residual_m": self.negative_residual_m,
+            "supporting_view_count": self.supporting_view_count,
+            "alternative_yaw_margin": self.alternative_margin,
+            "translation_correction_m": self.translation_correction_m,
+            "rotation_correction_deg": self.rotation_correction_deg,
+            "selected_yaw_offset_rad": self.selected_yaw_offset_rad,
+            "reachability_validated_yaw_offsets_rad": list(self.reachability_validated_yaw_offsets_rad),
         }
 
 
@@ -1136,40 +1180,64 @@ class MugHandleCadMatcher:
 
 
 class GenericMeshCadMatcher:
-    """桌面 OBJ 的通用点云--网格表面兜底匹配器。
+    """基于 CAD 表面模板的通用 6D 配准器。
 
-    它不依赖类别、尺寸公式或物体真值：从 OBJ 三角面均匀采样表面点，对固定
-    的桌面竖直轴枚举 yaw，并以修剪后的单向 Chamfer 距离细化平移。桌面物体通常
-    保持竖直，因此该安全兜底只输出绕 Z 的姿态；任意 roll/pitch、特征全局配准和
-    point-to-plane ICP/GICP 仍属于后续通用 6D 匹配工作，不能在此处伪称已支持。
+    该实现复用工业视觉常见的“局部几何特征全局配准 + 点到面 ICP”流程：CAD
+    网格均匀采样成模板，FPFH/RANSAC 产生不依赖桌面朝向的 6D 初值，随后以
+    多尺度 point-to-plane ICP 细化。最终只对相机实际可见的 CAD 表面评分，避免
+    背面和重复杯身把带把手物体拉到错误朝向。
     """
 
+    _VOXEL_SCALES_M = (0.008, 0.004, 0.0025)
+    _MODEL_CACHE: dict[str, tuple[o3d.geometry.PointCloud, o3d.pipelines.registration.Feature]] = {}
+
+    @staticmethod
+    def _quaternion_xyzw(rotation: np.ndarray) -> np.ndarray:
+        quaternion = np.empty(4, dtype=np.float64)
+        # Numerically stable matrix-to-quaternion conversion, output convention xyzw.
+        trace = float(np.trace(rotation))
+        if trace > 0.0:
+            scale = np.sqrt(trace + 1.0) * 2.0
+            qw = 0.25 * scale
+            qx = (rotation[2, 1] - rotation[1, 2]) / scale
+            qy = (rotation[0, 2] - rotation[2, 0]) / scale
+            qz = (rotation[1, 0] - rotation[0, 1]) / scale
+        else:
+            index = int(np.argmax(np.diag(rotation)))
+            if index == 0:
+                scale = np.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
+                qw, qx = (rotation[2, 1] - rotation[1, 2]) / scale, 0.25 * scale
+                qy, qz = (rotation[0, 1] + rotation[1, 0]) / scale, (rotation[0, 2] + rotation[2, 0]) / scale
+            elif index == 1:
+                scale = np.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
+                qw, qx = (rotation[0, 2] - rotation[2, 0]) / scale, (rotation[0, 1] + rotation[1, 0]) / scale
+                qy, qz = 0.25 * scale, (rotation[1, 2] + rotation[2, 1]) / scale
+            else:
+                scale = np.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
+                qw, qx = (rotation[1, 0] - rotation[0, 1]) / scale, (rotation[0, 2] + rotation[2, 0]) / scale
+                qy, qz = (rotation[1, 2] + rotation[2, 1]) / scale, 0.25 * scale
+        quaternion[:] = (qx, qy, qz, qw)
+        return quaternion / np.linalg.norm(quaternion)
+
+    # Kept as small compatibility helpers for the established mug matcher.  The
+    # generic path below no longer uses this yaw-only refinement as its primary
+    # estimator.
     @staticmethod
     def _surface_samples(model: CadModel) -> np.ndarray:
         triangles = model.vertices_object_m[model.triangles_object]
-        double_areas = np.linalg.norm(
-            np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1
-        )
-        if not np.all(np.isfinite(double_areas)) or float(double_areas.sum()) <= 1e-12:
+        areas = np.linalg.norm(np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1)
+        if not np.all(np.isfinite(areas)) or float(areas.sum()) <= 1e-12:
             raise RuntimeError(f"通用 CAD 网格表面积非法：{model.mesh_path}")
         count = min(900, max(300, len(triangles) * 4))
         generator = np.random.default_rng(20260923)
-        selected = generator.choice(len(triangles), size=count, p=double_areas / double_areas.sum())
-        first = generator.random(count)
-        second = generator.random(count)
-        root_first = np.sqrt(first)
-        barycentric = np.column_stack((1.0 - root_first, root_first * (1.0 - second), root_first * second))
-        return (triangles[selected] * barycentric[:, :, None]).sum(axis=1)
-
-    @staticmethod
-    def _trimmed_cost(distances: np.ndarray) -> float:
-        keep = max(80, int(len(distances) * 0.70))
-        return float(np.partition(distances, keep - 1)[:keep].mean())
+        chosen = generator.choice(len(triangles), size=count, p=areas / areas.sum())
+        first, second = generator.random(count), generator.random(count)
+        root = np.sqrt(first)
+        barycentric = np.column_stack((1.0 - root, root * (1.0 - second), root * second))
+        return (triangles[chosen] * barycentric[:, :, None]).sum(axis=1)
 
     @staticmethod
     def _nearest_surface(points: np.ndarray, surface: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        # 采样数上限为 900、点云上限为 500，因此这里的 NumPy 广播不会造成难以
-        # 控制的显存/内存开销，也避免为单个兜底功能额外引入 Open3D 依赖。
         squared = ((points[:, None, :] - surface[None, :, :]) ** 2).sum(axis=2)
         indices = np.argmin(squared, axis=1)
         return np.sqrt(squared[np.arange(len(points)), indices]), surface[indices]
@@ -1177,150 +1245,668 @@ class GenericMeshCadMatcher:
     def _fit_translation(
         self, points: np.ndarray, local_surface: np.ndarray, yaw_rad: float, initial_center: np.ndarray
     ) -> tuple[float, np.ndarray, np.ndarray]:
-        cosine, sine = np.cos(yaw_rad), np.sin(yaw_rad)
-        rotation = np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
+        rotation = self._rotation_z(yaw_rad)
         center = initial_center.copy()
         for _ in range(5):
             surface = local_surface @ rotation.T + center
             _, nearest = self._nearest_surface(points, surface)
-            # 可见点只覆盖 CAD 的一部分，因此只使用中位残差做平移更新，且限制
-            # 单步幅度以免遮挡面把网格拉向错误局部极值。
             update = np.clip(np.median(points - nearest, axis=0), -0.025, 0.025)
             center += update
             if float(np.linalg.norm(update)) < 2e-4:
                 break
         distances, _ = self._nearest_surface(points, local_surface @ rotation.T + center)
-        return self._trimmed_cost(distances), center, distances
+        return self._trimmed_mean(distances), center, distances
 
-    def _bidirectional_cost(self, points: np.ndarray, surface: np.ndarray) -> float:
-        """以双方都有支持的代价区分“杯身局部贴合”和完整网格解释。
+    @staticmethod
+    def _point_cloud(points: np.ndarray, voxel_m: float) -> o3d.geometry.PointCloud:
+        cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64)))
+        cloud = cloud.voxel_down_sample(voxel_m)
+        if len(cloud.points) < 40:
+            raise RuntimeError("通用 CAD 配准的有效点云不足")
+        cloud.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_m * 4.0, max_nn=48))
+        cloud.normalize_normals()
+        return cloud
 
-        单向 point-to-CAD Chamfer 允许一个圆柱杯身解释绝大部分像素，即使 CAD
-        把手被旋转到错误方位。主动观察把多个方向的点云合并后，CAD-to-point
-        项会要求把手等非对称表面也在观测中获得支持。两个方向都修剪，以免未
-        被任一相机看见的背面把正确 pose 错误惩罚。
-        """
-        forward, _ = self._nearest_surface(points, surface)
-        backward, _ = self._nearest_surface(surface, points)
-        return 0.45 * self._trimmed_cost(forward) + 0.55 * self._trimmed_cost(backward)
+    @classmethod
+    def _model_template(cls, model: CadModel) -> tuple[o3d.geometry.PointCloud, o3d.pipelines.registration.Feature]:
+        cache_key = str(model.mesh_path.resolve())
+        cached = cls._MODEL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(model.vertices_object_m),
+            o3d.utility.Vector3iVector(model.triangles_object.astype(np.int32)),
+        )
+        mesh.compute_vertex_normals()
+        sampled = mesh.sample_points_uniformly(number_of_points=5000, use_triangle_normal=True)
+        template = sampled.voxel_down_sample(cls._VOXEL_SCALES_M[0])
+        template.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.032, max_nn=80))
+        template.normalize_normals()
+        features = o3d.pipelines.registration.compute_fpfh_feature(
+            template, o3d.geometry.KDTreeSearchParamHybrid(radius=0.040, max_nn=120)
+        )
+        cls._MODEL_CACHE[cache_key] = (template, features)
+        return template, features
+
+    @staticmethod
+    def _fpfh(cloud: o3d.geometry.PointCloud, voxel_m: float) -> o3d.pipelines.registration.Feature:
+        return o3d.pipelines.registration.compute_fpfh_feature(
+            cloud, o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_m * 8.0, max_nn=120)
+        )
+
+    @staticmethod
+    def _trimmed_mean(values: np.ndarray, fraction: float = 0.72) -> float:
+        if len(values) == 0:
+            return float("inf")
+        count = max(12, int(len(values) * fraction))
+        return float(np.partition(values, count - 1)[:count].mean())
+
+    @staticmethod
+    def _rotation_z(angle: float) -> np.ndarray:
+        cosine, sine = np.cos(angle), np.sin(angle)
+        return np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
+
+    @staticmethod
+    def _critical_vertices(model: CadModel) -> np.ndarray | None:
+        templates = [item for item in model.grasp_templates if item.opposing_contact_pair is not None]
+        if not templates:
+            return None
+        template = max(templates, key=lambda item: item.quality)
+        pair = template.opposing_contact_pair
+        midpoint = (pair.positive_surface.center_object_m + pair.negative_surface.center_object_m) / 2.0
+        radius = float(np.clip(model.height_m * 0.36, 0.020, 0.045))
+        vertices = model.vertices_object_m
+        selected = vertices[np.linalg.norm(vertices - midpoint, axis=1) <= radius]
+        return selected[:: max(1, len(selected) // 220)] if len(selected) >= 24 else None
+
+    @staticmethod
+    def _distances(query: np.ndarray, target_cloud: o3d.geometry.PointCloud) -> np.ndarray:
+        query_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(query))
+        return np.asarray(query_cloud.compute_point_cloud_distance(target_cloud), dtype=np.float64)
+
+    def _coarse_transforms(
+        self, template: o3d.geometry.PointCloud, template_features: o3d.pipelines.registration.Feature,
+        observed: o3d.geometry.PointCloud,
+    ) -> list[tuple[np.ndarray, int]]:
+        """Return deterministic, independent global FPFH pose hypotheses."""
+        observed_features = self._fpfh(observed, self._VOXEL_SCALES_M[0])
+        hypotheses: list[tuple[np.ndarray, int]] = []
+        for seed_offset in range(4):
+            # Open3D RANSAC otherwise consumes a process-global random stream,
+            # making a saved RGB-D episode produce a different pose on replay.
+            o3d.utility.random.seed(20261010 + seed_offset)
+            result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+                template, observed, template_features, observed_features, True, 0.020,
+                o3d.pipelines.registration.TransformationEstimationPointToPoint(False), 4,
+                [o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.85),
+                 o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(0.020)],
+                o3d.pipelines.registration.RANSACConvergenceCriteria(40000, 0.999),
+            )
+            # A fixed overview camera may see only a narrow RGB-D silhouette;
+            # four non-coplanar FPFH correspondences are sufficient for a 6D
+            # seed, while ICP/visible-surface validation below decides whether
+            # it is usable.  Wrist fusion still needs stronger evidence.
+            if len(result.correspondence_set) >= 4:
+                hypotheses.append((np.asarray(result.transformation), len(result.correspondence_set)))
+        if not hypotheses:
+            raise RuntimeError("通用 CAD FPFH/RANSAC 未得到足够的全局几何对应")
+        return hypotheses
+
+    def _refine(
+        self, model: CadModel, points: np.ndarray, initial: np.ndarray,
+    ) -> tuple[np.ndarray, float, float, int]:
+        mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(model.vertices_object_m),
+            o3d.utility.Vector3iVector(model.triangles_object.astype(np.int32)),
+        )
+        mesh.compute_vertex_normals()
+        source_full = mesh.sample_points_uniformly(number_of_points=6500, use_triangle_normal=True)
+        transform = initial.copy()
+        fitness, rmse = 0.0, float("inf")
+        for voxel in self._VOXEL_SCALES_M:
+            source = source_full.voxel_down_sample(voxel)
+            target = self._point_cloud(points, voxel)
+            result = o3d.pipelines.registration.registration_icp(
+                source, target, voxel * 3.2, transform,
+                o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=80),
+            )
+            transform, fitness, rmse = np.asarray(result.transformation), float(result.fitness), float(result.inlier_rmse)
+        return transform, fitness, rmse, len(source_full.points)
+
+    def _critical_evidence(
+        self, model: CadModel, transform: np.ndarray, clouds: list[np.ndarray], target_cloud: o3d.geometry.PointCloud,
+    ) -> tuple[float | None, float | None, int | None]:
+        critical = self._critical_vertices(model)
+        if critical is None:
+            return None, None, None
+        transformed = critical @ transform[:3, :3].T + transform[:3, 3]
+        per_view_support = [
+            float(np.mean(self._distances(transformed, self._point_cloud(cloud, 0.0025)) <= 0.012))
+            for cloud in clouds
+        ]
+        support = max(per_view_support)
+        opposite = transform.copy()
+        opposite[:3, :3] = transform[:3, :3] @ self._rotation_z(np.pi)
+        alternate = critical @ opposite[:3, :3].T + opposite[:3, 3]
+        alternative_support = float(np.mean(self._distances(alternate, target_cloud) <= 0.012))
+        return support, float(support - alternative_support), sum(value >= 0.08 for value in per_view_support)
 
     def _match_points(
         self,
         model: CadModel,
         points: np.ndarray,
+        clouds: list[np.ndarray],
         segmentation_confidence: float,
-        matching_method: str,
+        *,
+        enforce_grasp_evidence: bool = True,
     ) -> CadPoseEstimate:
         if model.geometry_type != "mesh":
             raise ValueError("GenericMeshCadMatcher 仅处理 geometry_type=mesh")
-        points = points[:: max(1, len(points) // 500)]
-        surface_samples = self._surface_samples(model)
-        mesh_center_object = (model.vertices_object_m.min(axis=0) + model.vertices_object_m.max(axis=0)) / 2.0
-        local_surface = surface_samples - mesh_center_object
-        initial_center = np.median(points, axis=0)
-
-        coarse_candidates = []
-        for yaw_rad in np.linspace(-np.pi, np.pi, 36, endpoint=False):
-            cost, center, _ = self._fit_translation(points, local_surface, float(yaw_rad), initial_center)
-            surface = local_surface @ np.array([
-                [np.cos(yaw_rad), -np.sin(yaw_rad), 0.0],
-                [np.sin(yaw_rad), np.cos(yaw_rad), 0.0],
-                [0.0, 0.0, 1.0],
-            ]).T + center
-            coarse_candidates.append((self._bidirectional_cost(points, surface), float(yaw_rad), center))
-        coarse_candidates.sort(key=lambda candidate: candidate[0])
-
-        refined_candidates = []
-        for _, coarse_yaw, coarse_center in coarse_candidates[:3]:
-            for yaw_rad in coarse_yaw + np.arange(-0.18, 0.1801, 0.01):
-                residual, center, distances = self._fit_translation(points, local_surface, float(yaw_rad), coarse_center)
-                surface = local_surface @ np.array([
-                    [np.cos(yaw_rad), -np.sin(yaw_rad), 0.0],
-                    [np.sin(yaw_rad), np.cos(yaw_rad), 0.0],
-                    [0.0, 0.0, 1.0],
-                ]).T + center
-                refined_candidates.append((self._bidirectional_cost(points, surface), residual, float(yaw_rad), center, distances))
-        _, residual, yaw_rad, mesh_center_base, distances = min(refined_candidates, key=lambda candidate: candidate[0])
-
-        scale_m = float(np.min(model.dimensions_m))
-        inlier_distance_m = float(np.clip(scale_m * 0.08, 0.004, 0.012))
-        residual_limit_m = inlier_distance_m * 1.8
-        inlier_ratio = float(np.mean(distances < inlier_distance_m))
-        geometry_confidence = float(np.clip((1.0 - residual / residual_limit_m) * inlier_ratio, 0.0, 1.0))
-        if residual > residual_limit_m or inlier_ratio < 0.45 or geometry_confidence < 0.35:
+        observed = self._point_cloud(points, self._VOXEL_SCALES_M[0])
+        template, template_features = self._model_template(model)
+        coarse_hypotheses = self._coarse_transforms(template, template_features, observed)
+        mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(model.vertices_object_m),
+            o3d.utility.Vector3iVector(model.triangles_object.astype(np.int32)),
+        )
+        observed_fine = self._point_cloud(points, 0.0025)
+        observed_points = np.asarray(observed_fine.points)
+        # The cylindrical part of a mug has repeated geometry.  Branching four
+        # CAD-local yaw hypotheses lets the handle select the correct global
+        # solution after RANSAC without assuming that the object is upright.
+        # This is a bounded, deterministic form of industrial pose-hypothesis
+        # verification rather than the old exhaustive x/y/yaw grid search.
+        candidates = []
+        for initial, correspondence_count in coarse_hypotheses:
+            for yaw_offset in (0.0, np.pi / 2.0, np.pi, -np.pi / 2.0):
+                local_yaw = np.eye(4)
+                local_yaw[:3, :3] = self._rotation_z(yaw_offset)
+                transform, icp_fitness, icp_rmse, sample_count = self._refine(model, points, initial @ local_yaw)
+                rendered = mesh.sample_points_uniformly(number_of_points=4000)
+                rendered.transform(transform)
+                rendered_points = np.asarray(rendered.points)
+                observed_to_model = self._distances(observed_points, rendered)
+                model_to_observed = self._distances(rendered_points, observed_fine)
+                residual = self._trimmed_mean(observed_to_model)
+                visible_support = float(np.mean(model_to_observed <= 0.010))
+                inlier_ratio = float(np.mean(observed_to_model <= 0.008))
+                critical_support, critical_margin, critical_baseline_count = self._critical_evidence(
+                    model, transform, clouds, observed_fine
+                )
+                critical_ok = critical_support is None or (
+                    critical_support >= 0.08
+                    and critical_margin is not None
+                    and critical_margin >= 0.06
+                    and critical_baseline_count >= 2
+                )
+                score = 0.48 * inlier_ratio + 0.32 * visible_support + 0.20 * icp_fitness - residual / 0.020
+                if not critical_ok:
+                    score -= 0.75
+                candidates.append((score, transform, icp_fitness, icp_rmse, sample_count, residual, visible_support,
+                                   inlier_ratio, critical_support, critical_margin, critical_baseline_count,
+                                   correspondence_count))
+        (_, transform, icp_fitness, icp_rmse, sample_count, residual, visible_support,
+         inlier_ratio, critical_support, critical_margin, critical_baseline_count,
+         correspondence_count) = max(candidates, key=lambda item: item[0])
+        if enforce_grasp_evidence and critical_support is not None and (
+            critical_support < 0.08
+            or critical_margin is None
+            or critical_margin < 0.06
+            or critical_baseline_count < 2
+        ):
             raise RuntimeError(
-                f"通用 CAD 网格配准置信度不足：残差={residual:.4f}m，内点率={inlier_ratio:.3f}，"
-                f"几何置信度={geometry_confidence:.3f}"
+                "通用 CAD 抓取关键区证据不足："
+                f"覆盖率={critical_support:.3f}，替代朝向差值={critical_margin:.3f}，"
+                f"支持腕部基线数={critical_baseline_count}"
             )
+        # ICP fitness is measured CAD→partial-observation, hence it is
+        # intentionally low for an occluded but geometrically excellent view.
+        # Use the bidirectional visible-surface score as the acceptance signal;
+        # retain raw ICP fitness in diagnostics for audit rather than making
+        # partial visibility look like a failed registration.
+        confidence = float(np.clip(
+            (0.60 * inlier_ratio + 0.40 * visible_support) * (1.0 - residual / 0.018), 0.0, 1.0
+        ))
+        if residual > 0.012 or inlier_ratio < 0.42 or visible_support < 0.20 or confidence < 0.30:
+            raise RuntimeError(
+                f"通用 CAD 表面配准置信度不足：残差={residual:.4f}m，内点率={inlier_ratio:.3f}，可见支持={visible_support:.3f}"
+            )
+        yaw = float(np.arctan2(transform[1, 0], transform[0, 0]))
+        return CadPoseEstimate(
+            model_id=model.model_id, position_base_m=transform[:3, 3],
+            orientation_xyzw=self._quaternion_xyzw(transform[:3, :3]), transform_base_object=transform,
+            surface_residual_m=residual, inlier_ratio=inlier_ratio, segmentation_confidence=segmentation_confidence,
+            geometry_confidence=confidence, axial_yaw_observable=True, cylinder_axis_base=transform[:3, 2],
+            point_count=len(points), matching_method="generic_mesh_fpfh_ransac_multiscale_icp_visible_surface_refinement",
+            object_yaw_rad=yaw, critical_region_support=critical_support, critical_region_margin=critical_margin,
+            registration_diagnostics={"coarse_method": "fpfh_ransac", "coarse_correspondence_count": correspondence_count,
+                                      "coarse_hypothesis_count": len(candidates),
+                                      "icp_method": "multiscale_point_to_plane", "icp_fitness": icp_fitness,
+                                      "icp_rmse_m": icp_rmse, "visible_surface_support": visible_support,
+                                      "critical_region_baseline_count": critical_baseline_count,
+                                      "cad_surface_sample_count": sample_count},
+        )
 
-        _, opposite_center, _ = self._fit_translation(points, local_surface, yaw_rad + np.pi, mesh_center_base)
-        opposite_rotation = np.array([
-            [np.cos(yaw_rad + np.pi), -np.sin(yaw_rad + np.pi), 0.0],
-            [np.sin(yaw_rad + np.pi), np.cos(yaw_rad + np.pi), 0.0],
-            [0.0, 0.0, 1.0],
-        ])
-        selected_rotation = np.array([
-            [np.cos(yaw_rad), -np.sin(yaw_rad), 0.0],
-            [np.sin(yaw_rad), np.cos(yaw_rad), 0.0],
-            [0.0, 0.0, 1.0],
-        ])
-        selected_cost = self._bidirectional_cost(points, local_surface @ selected_rotation.T + mesh_center_base)
-        opposite_cost = self._bidirectional_cost(points, local_surface @ opposite_rotation.T + opposite_center)
-        yaw_observable = bool(opposite_cost - selected_cost >= inlier_distance_m * 0.20)
-        cosine, sine = np.cos(yaw_rad), np.sin(yaw_rad)
-        rotation = np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
+    def _coarse_pose_from_points(
+        self,
+        model: CadModel,
+        points: np.ndarray,
+        frame: UnifiedCameraFrame,
+        mask: np.ndarray,
+        segmentation_confidence: float,
+        reason: str,
+    ) -> CadPoseEstimate:
+        """Generate a conservative geometric seed when one overview frame is sparse.
+
+        This is deliberately not a graspable result: it only allows active
+        wrist observation to start.  The final pose is always rebuilt by the
+        FPFH/RANSAC/ICP multi-view path and its two-baseline grasp gate.
+        """
+        center = (np.min(points, axis=0) + np.max(points, axis=0)) / 2.0
+        triangles = model.vertices_object_m[model.triangles_object]
+        triangle_normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+        triangle_normals /= np.linalg.norm(triangle_normals, axis=1, keepdims=True)
+        areas = np.linalg.norm(np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1)
+        generator = np.random.default_rng(20260923)
+        chosen = generator.choice(len(triangles), size=1600, p=areas / areas.sum())
+        first, second = generator.random(1600), generator.random(1600)
+        root = np.sqrt(first)
+        barycentric = np.column_stack((1.0 - root, root * (1.0 - second), root * second))
+        surface = (triangles[chosen] * barycentric[:, :, None]).sum(axis=1)
+        normals = triangle_normals[chosen]
+        # This bounded 2.5D score is a *seed only* for moving the wrist toward
+        # an otherwise feature-poor overview.  It does not emit a graspable
+        # pose or participate in final selection, which remains full 6D
+        # FPFH/RANSAC + multi-scale ICP across wrist RGB-D frames.
+        candidates = []
+        for yaw_candidate in np.linspace(-np.pi, np.pi, num=48, endpoint=False):
+            rotation = self._rotation_z(float(yaw_candidate))
+            world_surface = surface @ rotation.T + center
+            world_normals = normals @ rotation.T
+            # Approximate a CAD depth render by keeping only front-facing mesh
+            # samples.  Unlike the old all-surface Chamfer seed, this lets the
+            # overview image distinguish which side contains the handle.
+            camera_position_base_m = frame.base_from_camera[:3, 3]
+            facing = np.einsum("ij,ij->i", world_normals, camera_position_base_m - world_surface) > 0.02
+            visible_surface = surface[facing]
+            if len(visible_surface) < 80:
+                visible_surface = surface
+            residual, candidate_center, _ = self._fit_translation(
+                points, visible_surface, float(yaw_candidate), center
+            )
+            rendered = visible_surface @ rotation.T + candidate_center
+            homogeneous = np.column_stack((rendered, np.ones(len(rendered))))
+            camera = homogeneous @ np.linalg.inv(frame.base_from_camera).T
+            depth = -camera[:, 2]
+            rows = np.rint(frame.intrinsic[1, 2] - camera[:, 1] * frame.intrinsic[1, 1] / depth).astype(int)
+            columns = np.rint(frame.intrinsic[0, 2] + camera[:, 0] * frame.intrinsic[0, 0] / depth).astype(int)
+            inside = (
+                np.isfinite(depth) & (depth > 0.10)
+                & (rows >= 0) & (rows < mask.shape[0]) & (columns >= 0) & (columns < mask.shape[1])
+            )
+            rows, columns, depth = rows[inside], columns[inside], depth[inside]
+            observed = frame.depth[rows, columns] if len(rows) else np.empty(0)
+            aligned = np.isfinite(observed) & (observed > 0.10) & mask[rows, columns]
+            image_residual = self._trimmed_mean(np.abs(observed[aligned] - depth[aligned])) if np.any(aligned) else 0.10
+            coverage = float(np.count_nonzero(aligned) / max(1, len(visible_surface)))
+            candidates.append((residual + image_residual - 0.010 * coverage, residual, float(yaw_candidate), candidate_center))
+        _, residual, yaw, center = min(candidates, key=lambda item: item[0])
+        rotation = self._rotation_z(yaw)
         transform = np.eye(4)
-        transform[:3, :3] = rotation
-        # 搜索的是 CAD 包围盒中心；输出仍必须是 CAD 原点的世界坐标，供抓取标注
-        # ``T_object_grasp`` 正确相乘。
-        transform[:3, 3] = mesh_center_base - rotation @ mesh_center_object
+        transform[:3, :3], transform[:3, 3] = rotation, center
         return CadPoseEstimate(
             model_id=model.model_id,
-            position_base_m=transform[:3, 3],
-            orientation_xyzw=np.array([0.0, 0.0, np.sin(yaw_rad / 2.0), np.cos(yaw_rad / 2.0)]),
+            position_base_m=center,
+            orientation_xyzw=self._quaternion_xyzw(rotation),
             transform_base_object=transform,
             surface_residual_m=residual,
-            inlier_ratio=inlier_ratio,
+            inlier_ratio=0.0,
             segmentation_confidence=segmentation_confidence,
-            geometry_confidence=geometry_confidence,
-            axial_yaw_observable=yaw_observable,
-            cylinder_axis_base=np.array([0.0, 0.0, 1.0]),
+            geometry_confidence=0.05,
+            axial_yaw_observable=False,
+            cylinder_axis_base=rotation[:, 2],
             point_count=len(points),
-            matching_method=matching_method,
-            object_yaw_rad=yaw_rad if yaw_observable else None,
+            matching_method="generic_mesh_overview_geometric_seed_for_active_observation",
+            object_yaw_rad=yaw,
+            registration_diagnostics={
+                "coarse_seed_only": True,
+                "fallback_reason": reason,
+                "overview_surface_seed_yaw_hypothesis_count": len(candidates),
+            },
         )
 
     def match(self, model: CadModel, segmentation: SegmentationResult, frame: UnifiedCameraFrame) -> CadPoseEstimate:
-        return self._match_points(
-            model,
-            _points_from_mask(frame, segmentation.mask),
-            segmentation.confidence,
-            "generic_mesh_surface_chamfer_yaw_refinement",
-        )
+        points = _points_from_mask(frame, segmentation.mask)
+        # A fixed-camera mesh pose is only a coarse ROI/approach seed.  It must
+        # not be allowed to satisfy the two-wrist-baseline grasp gate by itself;
+        # ``match_multiview`` below is the sole producer of a graspable pose.
+        try:
+            estimate = self._match_points(
+                model, points, [points], segmentation.confidence, enforce_grasp_evidence=False
+            )
+            # 当前控制场景是已知桌面工位。固定 RGB-D 的局部杯身视图有时会令
+            # 全局 FPFH 把 CAD 倾倒到错误 6D 局部极值；这类结果不能拿来决定
+            # 中性观察位的 TCP 方向。仅在“竖直且中心接近观测包围盒”时采用它；
+            # 否则保留相同点云生成的保守桌面几何种子，最终 6D/yaw 仍由腕部
+            # ROI 表面证据决定。
+            observed_center = (np.min(points, axis=0) + np.max(points, axis=0)) / 2.0
+            vertical_alignment = float(np.dot(estimate.transform_base_object[:3, 2], np.array([0.0, 0.0, 1.0])))
+            center_error = float(np.linalg.norm(estimate.position_base_m - observed_center))
+            if vertical_alignment < 0.94 or center_error > 0.030:
+                raise RuntimeError(
+                    "固定相机 FPFH 全局 pose 不满足桌面粗定位一致性："
+                    f"竖直对齐={vertical_alignment:.3f}，中心偏差={center_error:.4f}m"
+                )
+            return estimate
+        except RuntimeError as error:
+            return self._coarse_pose_from_points(
+                model, points, frame, segmentation.mask, segmentation.confidence, str(error)
+            )
 
-    def match_multiview(
-        self,
-        model: CadModel,
-        observations: list[tuple[SegmentationResult, UnifiedCameraFrame]],
-    ) -> CadPoseEstimate:
-        """将多个已外参标定的 RGB-D 观测合并到基座系后统一匹配。
-
-        每一帧先独立限采样，再拼接，避免某一距离很近的相机因像素更多而淹没
-        其它观察方向。这里的融合只使用 RGB-D、相机外参与 CAD，不读取物体真值。
-        """
+    def match_multiview(self, model: CadModel, observations: list[tuple[SegmentationResult, UnifiedCameraFrame]]) -> CadPoseEstimate:
         if len(observations) < 2:
             raise ValueError("多视角 mesh 配准至少需要两帧 RGB-D 观测")
-        clouds = []
-        confidences = []
-        for segmentation, frame in observations:
-            cloud = _points_from_mask(frame, segmentation.mask)
-            clouds.append(cloud[:: max(1, len(cloud) // 350)])
-            confidences.append(segmentation.confidence)
+        clouds = [_points_from_mask(frame, segmentation.mask) for segmentation, frame in observations]
+        balanced = [cloud[:: max(1, len(cloud) // 900)] for cloud in clouds]
+        # 通用全局配准只负责把对象送入近距抓取工作区。两片夹持面的
+        # 安全门禁由 GraspRoiMatcher 在下游单独执行，不能把它混作整体
+        # CAD pose 的失败原因。
         return self._match_points(
             model,
-            np.concatenate(clouds, axis=0),
-            float(np.mean(confidences)),
-            "generic_mesh_multiview_surface_chamfer_yaw_refinement",
+            np.concatenate(balanced, axis=0),
+            clouds,
+            float(np.mean([item[0].confidence for item in observations])),
+            enforce_grasp_evidence=False,
+        )
+
+
+class GraspRoiMatcher:
+    """从 ``opposing_contact_pair`` 派生的通用抓取局部表面 matcher。
+
+    它不识别物体类别，也不读取仿真真值：全局 CAD pose 给出物体附近的工作区，
+    两片由 grasp JSON 标注的接触面则在腕部 RGB-D 中独立匹配。为处理杯身等
+    旋转对称主体，先保留一组 CAD-local yaw 假设，再对每一假设做受限的局部
+    刚体精修。最终只有正、负接触面均有观测支持时才输出抓取 pose。
+    """
+
+    _SUPPORT_DISTANCE_M = 0.009
+    _CORRESPONDENCE_DISTANCE_M = 0.018
+    _MIN_SURFACE_SUPPORT = 0.16
+    # RGB-D 离散化、腕部外参和薄把手的 CAD 三角面会在单侧留下约厘米级
+    # 残差；超过 12 mm 则不再把它视为可安全夹持的同一接触面。
+    _MAX_SURFACE_RESIDUAL_M = 0.012
+    # 全局表面配准只承诺把机械臂带入近距工作区；局部抓取面允许在该工作区内
+    # 修正 2.5 cm，最终仍由双接触区残差而非粗中心决定是否闭爪。
+    _MAX_LOCAL_TRANSLATION_M = 0.025
+    _MAX_LOCAL_ROTATION_DEG = 10.0
+    _YAW_HYPOTHESES = 24
+
+    @staticmethod
+    def _rotation_angle_deg(rotation: np.ndarray) -> float:
+        cosine = float(np.clip((np.trace(rotation) - 1.0) / 2.0, -1.0, 1.0))
+        return float(np.rad2deg(np.arccos(cosine)))
+
+    @staticmethod
+    def _nearest(query: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        squared = ((query[:, None, :] - target[None, :, :]) ** 2).sum(axis=2)
+        indices = np.argmin(squared, axis=1)
+        return np.sqrt(squared[np.arange(len(query)), indices]), target[indices], indices
+
+    @staticmethod
+    def _kabsch(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+        """Return the rigid correction that maps already-world ``source`` to target."""
+        source_center, target_center = source.mean(axis=0), target.mean(axis=0)
+        covariance = (source - source_center).T @ (target - target_center)
+        left, _, right = np.linalg.svd(covariance)
+        rotation = right.T @ left.T
+        if np.linalg.det(rotation) < 0.0:
+            right[-1, :] *= -1.0
+            rotation = right.T @ left.T
+        correction = np.eye(4)
+        correction[:3, :3] = rotation
+        correction[:3, 3] = target_center - rotation @ source_center
+        return correction
+
+    @staticmethod
+    def _roi_vertices(model: CadModel, surface: ContactSurface) -> np.ndarray:
+        """Extract a CAD patch around one annotated contact surface.
+
+        The annotation gives a point and normal, not mesh face indices.  A
+        thin normal slab plus a height-scaled tangent envelope works for any
+        CAD carrying the existing generic contact-pair schema.
+        """
+        delta = model.vertices_object_m - surface.center_object_m
+        normal_distance = np.abs(delta @ surface.normal_object)
+        tangent_distance = np.linalg.norm(
+            delta - np.outer(delta @ surface.normal_object, surface.normal_object), axis=1
+        )
+        slab_m = float(np.clip(model.height_m * 0.055, 0.0035, 0.0065))
+        radius_m = float(np.clip(model.height_m * 0.38, 0.024, 0.045))
+        selected = model.vertices_object_m[(normal_distance <= slab_m) & (tangent_distance <= radius_m)]
+        if len(selected) < 16:
+            raise RuntimeError(f"抓取 ROI CAD 面采样不足：{surface.region_id} 仅有 {len(selected)} 个顶点")
+        return selected[:: max(1, len(selected) // 120)]
+
+    @staticmethod
+    def _trimmed_mean(values: np.ndarray, fraction: float = 0.50) -> float:
+        if len(values) == 0:
+            return float("inf")
+        count = max(8, int(len(values) * fraction))
+        return float(np.partition(values, count - 1)[:count].mean())
+
+    def _surface_evidence(
+        self, transformed_surface: np.ndarray, clouds: list[np.ndarray]
+    ) -> tuple[float, float, list[float]]:
+        supports: list[float] = []
+        residuals: list[float] = []
+        for cloud in clouds:
+            distances, _, _ = self._nearest(transformed_surface, cloud)
+            supports.append(float(np.mean(distances <= self._SUPPORT_DISTANCE_M)))
+            residuals.append(self._trimmed_mean(distances))
+        return max(supports, default=0.0), min(residuals, default=float("inf")), supports
+
+    def _refine_candidate(
+        self, initial: np.ndarray, object_roi: np.ndarray, observed: np.ndarray
+    ) -> np.ndarray | None:
+        transform = initial.copy()
+        for _ in range(6):
+            world_roi = object_roi @ transform[:3, :3].T + transform[:3, 3]
+            distances, nearest, _ = self._nearest(world_roi, observed)
+            keep = distances <= self._CORRESPONDENCE_DISTANCE_M
+            if int(np.count_nonzero(keep)) < 18:
+                return None
+            correction = self._kabsch(world_roi[keep], nearest[keep])
+            transform = correction @ transform
+            # ``transform @ inv(initial)`` 的平移分量会包含“绕 CAD 原点
+            # 旋转”带来的基座原点项；这里的局部收敛约束应比较物体中心位置，
+            # 而非该复合矩阵的平移列。
+            relative_rotation = transform[:3, :3] @ initial[:3, :3].T
+            if (
+                float(np.linalg.norm(transform[:3, 3] - initial[:3, 3])) > self._MAX_LOCAL_TRANSLATION_M
+                or self._rotation_angle_deg(relative_rotation) > self._MAX_LOCAL_ROTATION_DEG
+            ):
+                return None
+            if (
+                float(np.linalg.norm(correction[:3, 3])) < 2e-4
+                and self._rotation_angle_deg(correction[:3, :3]) < 0.15
+            ):
+                break
+        return transform
+
+    def refine(
+        self,
+        model: CadModel,
+        template: GraspTemplate,
+        global_pose: CadPoseEstimate,
+        observations: list[tuple[SegmentationResult, UnifiedCameraFrame]],
+    ) -> GraspRoiEstimate:
+        clouds = [
+            _points_from_mask(frame, segmentation.mask)[:: max(1, segmentation.pixel_count // 850)]
+            for segmentation, frame in observations
+        ]
+        return self.refine_clouds(model, template, global_pose, clouds)
+
+    def refine_clouds(
+        self,
+        model: CadModel,
+        template: GraspTemplate,
+        global_pose: CadPoseEstimate,
+        clouds: list[np.ndarray],
+    ) -> GraspRoiEstimate:
+        """Cloud-level entry point used by deterministic regression tests."""
+        if len(clouds) < 2:
+            raise RuntimeError("抓取 ROI 精配准至少需要两条腕部 RGB-D 基线")
+        clouds = [np.asarray(cloud, dtype=np.float64) for cloud in clouds]
+        if any(len(cloud) < 40 for cloud in clouds):
+            raise RuntimeError("抓取 ROI 精配准的单帧有效点不足")
+        positive_object = self._roi_vertices(model, template.opposing_contact_pair.positive_surface)
+        negative_object = self._roi_vertices(model, template.opposing_contact_pair.negative_surface)
+        object_roi = np.concatenate((positive_object, negative_object), axis=0)
+        observed = np.concatenate(clouds, axis=0)
+        if len(observed) < 80:
+            raise RuntimeError("抓取 ROI 精配准的腕部有效点不足")
+
+        candidates: list[tuple[float, np.ndarray, float, float, float, float, int, float]] = []
+        for yaw_offset in np.linspace(-np.pi, np.pi, self._YAW_HYPOTHESES, endpoint=False):
+            local_yaw = np.eye(4)
+            local_yaw[:3, :3] = GenericMeshCadMatcher._rotation_z(float(yaw_offset))
+            initial = global_pose.transform_base_object @ local_yaw
+            refined = self._refine_candidate(initial, object_roi, observed)
+            # 抓取区在单一腕部图像里经常只露出把手的一条外弧。此时最近邻
+            # Kabsch 可能被部分曲面拉向错误的小旋转；原始 CAD yaw 假设本身
+            # 仍须作为可解释候选进入双表面证据门禁，而不是被优化器静默丢弃。
+            if refined is None:
+                refined = initial
+            positive = positive_object @ refined[:3, :3].T + refined[:3, 3]
+            negative = negative_object @ refined[:3, :3].T + refined[:3, 3]
+            positive_support, positive_residual, positive_per_view = self._surface_evidence(positive, clouds)
+            negative_support, negative_residual, negative_per_view = self._surface_evidence(negative, clouds)
+            supporting_views = sum(
+                max(pos, neg) >= self._MIN_SURFACE_SUPPORT
+                for pos, neg in zip(positive_per_view, negative_per_view)
+            )
+            pair_support = min(positive_support, negative_support)
+            score = 1.20 * pair_support + 0.20 * (positive_support + negative_support) - (
+                positive_residual + negative_residual
+            ) / 0.030
+            candidates.append((
+                score, refined, positive_support, negative_support, positive_residual,
+                negative_residual, supporting_views, float(yaw_offset),
+            ))
+        if not candidates:
+            raise RuntimeError("抓取 ROI 精配准没有获得足够的 CAD--深度对应")
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        (score, transform, positive_support, negative_support, positive_residual,
+         negative_residual, supporting_views, selected_yaw_offset) = candidates[0]
+        alternative_score = max(
+            (item[0] for item in candidates[1:]
+             if abs(float(np.arctan2(np.sin(item[7] - selected_yaw_offset), np.cos(item[7] - selected_yaw_offset)))) >= 0.35),
+            default=score - 1.0,
+        )
+        margin = float(score - alternative_score)
+        translation_correction = float(np.linalg.norm(
+            transform[:3, 3] - global_pose.transform_base_object[:3, 3]
+        ))
+        rotation_correction = self._rotation_angle_deg(
+            transform[:3, :3] @ global_pose.transform_base_object[:3, :3].T
+        )
+        if (
+            positive_support < self._MIN_SURFACE_SUPPORT
+            or negative_support < self._MIN_SURFACE_SUPPORT
+            or supporting_views < 2
+            or margin < 0.06
+            or positive_residual > self._MAX_SURFACE_RESIDUAL_M
+            or negative_residual > self._MAX_SURFACE_RESIDUAL_M
+        ):
+            raise RuntimeError(
+                "抓取 ROI 证据不足："
+                f"正面覆盖={positive_support:.3f}，负面覆盖={negative_support:.3f}，"
+                f"支持视角={supporting_views}，候选差值={margin:.3f}，"
+                f"残差=({positive_residual:.4f},{negative_residual:.4f})m"
+            )
+        confidence = float(np.clip(
+            min(global_pose.geometry_confidence, (positive_support + negative_support) / 0.70)
+            * (1.0 - max(positive_residual, negative_residual) / 0.012), 0.0, 1.0
+        ))
+        diagnostics = dict(global_pose.registration_diagnostics or {})
+        diagnostics["grasp_roi"] = {
+            "template_id": template.template_id,
+            "positive_surface_region": template.opposing_contact_pair.positive_surface.region_id,
+            "negative_surface_region": template.opposing_contact_pair.negative_surface.region_id,
+            "positive_support": positive_support,
+            "negative_support": negative_support,
+            "positive_residual_m": positive_residual,
+            "negative_residual_m": negative_residual,
+            "supporting_view_count": supporting_views,
+            "alternative_yaw_margin": margin,
+            "translation_correction_m": translation_correction,
+            "rotation_correction_deg": rotation_correction,
+            "selected_yaw_offset_rad": selected_yaw_offset,
+        }
+        # 视觉匹配的离散 CAD yaw 与机器人 IK 的窄奇异区不应彼此绑死。只对
+        # ±5° 的局部邻域重新计算两片接触面的独立深度支持；这样后续由 MoveIt
+        # 选择可达姿态时仍然是“ROI 已验证”的 CAD pose，而不是无约束地旋转
+        # 夹爪去碰运气。
+        reachable_yaw_offsets: list[float] = []
+        for yaw_delta in (0.0, -np.deg2rad(5.0), np.deg2rad(5.0), -np.deg2rad(10.0), np.deg2rad(10.0)):
+            local_rotation = GenericMeshCadMatcher._rotation_z(float(yaw_delta))
+            candidate_transform = transform.copy()
+            candidate_transform[:3, :3] = transform[:3, :3] @ local_rotation
+            candidate_positive = positive_object @ candidate_transform[:3, :3].T + candidate_transform[:3, 3]
+            candidate_negative = negative_object @ candidate_transform[:3, :3].T + candidate_transform[:3, 3]
+            candidate_positive_support, candidate_positive_residual, candidate_positive_views = self._surface_evidence(
+                candidate_positive, clouds
+            )
+            candidate_negative_support, candidate_negative_residual, candidate_negative_views = self._surface_evidence(
+                candidate_negative, clouds
+            )
+            candidate_view_count = sum(
+                max(pos, neg) >= self._MIN_SURFACE_SUPPORT
+                for pos, neg in zip(candidate_positive_views, candidate_negative_views)
+            )
+            if (
+                candidate_positive_support >= self._MIN_SURFACE_SUPPORT
+                and candidate_negative_support >= self._MIN_SURFACE_SUPPORT
+                and candidate_view_count >= 2
+                and candidate_positive_residual <= self._MAX_SURFACE_RESIDUAL_M
+                and candidate_negative_residual <= self._MAX_SURFACE_RESIDUAL_M
+            ):
+                reachable_yaw_offsets.append(float(yaw_delta))
+        diagnostics["grasp_roi"]["reachability_validated_yaw_offsets_rad"] = reachable_yaw_offsets
+        pose = replace(
+            global_pose,
+            position_base_m=transform[:3, 3],
+            orientation_xyzw=GenericMeshCadMatcher._quaternion_xyzw(transform[:3, :3]),
+            transform_base_object=transform,
+            geometry_confidence=confidence,
+            axial_yaw_observable=True,
+            cylinder_axis_base=transform[:3, 2],
+            # 固定相机的 fallback seed 在此已被真正的双表面 ROI 精修取代；对外
+            # 仍保持通用 CAD 管线的稳定名称，细节在 diagnostics 中可审计。
+            matching_method=(
+                "generic_mesh_fpfh_ransac_multiscale_icp_visible_surface_refinement"
+                if global_pose.matching_method.startswith("generic_mesh_")
+                else global_pose.matching_method
+            ),
+            object_yaw_rad=float(np.arctan2(transform[1, 0], transform[0, 0])),
+            critical_region_support=min(positive_support, negative_support),
+            critical_region_margin=margin,
+            registration_diagnostics=diagnostics,
+        )
+        return GraspRoiEstimate(
+            pose=pose,
+            template_id=template.template_id,
+            positive_support=positive_support,
+            negative_support=negative_support,
+            positive_residual_m=positive_residual,
+            negative_residual_m=negative_residual,
+            supporting_view_count=supporting_views,
+            alternative_margin=margin,
+            translation_correction_m=translation_correction,
+            rotation_correction_deg=rotation_correction,
+            selected_yaw_offset_rad=selected_yaw_offset,
+            reachability_validated_yaw_offsets_rad=tuple(reachable_yaw_offsets),
         )
 
 
