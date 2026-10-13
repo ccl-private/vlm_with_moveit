@@ -49,10 +49,12 @@ class UnifiedPandaCupSimulation:
         "purple_cube",
         "magenta_block",
         "yellow_mug",
+        "orange_rabbit",
     )
     _REST_EQUALITIES = {
         "magenta_block": "magenta_block_rest",
         "yellow_mug": "yellow_mug_rest",
+        "orange_rabbit": "orange_rabbit_rest",
     }
 
     def __init__(self, root: Path, width: int = 640, height: int = 480, create_renderers: bool = True) -> None:
@@ -97,6 +99,7 @@ class UnifiedPandaCupSimulation:
             # MuJoCo freejoint 四元数为 w,x,y,z；绕 Z 180° 让把手面向相机/作业侧。
             # 该姿态不作为感知真值输入。
             "yellow_mug_freejoint": ((0.45, -0.12, 0.445), (0.0, 0.0, 0.0, 1.0)),
+            "orange_rabbit_freejoint": ((0.28, -0.40, 0.505), (1.0, 0.0, 0.0, 0.0)),
         }
         for joint_name, (position, quaternion) in graspable_object_poses.items():
             joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
@@ -184,6 +187,13 @@ class UnifiedPandaCupSimulation:
         self.model.eq_data[equality_id, 3:6] = relative_position
         self.model.eq_data[equality_id, 6:10] = relative_quaternion_wxyz
         self.data.eq_active[equality_id] = 1
+
+    def release_object_rest(self, object_name: str) -> None:
+        """通过统一命名约定解除工件静置约束；仅在接触验证后调用。"""
+        equality_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_EQUALITY, f"{object_name}_rest")
+        if equality_id >= 0:
+            self.data.eq_active[equality_id] = 0
+            mujoco.mj_forward(self.model, self.data)
 
     def _body_horizontal_radius(self, body_id: int) -> float:
         geom_address = self.model.body_geomadr[body_id]
@@ -331,7 +341,7 @@ class UnifiedPandaCupSimulation:
             for name in joint_names
         }
         objects: dict[str, dict[str, np.ndarray]] = {}
-        for object_name in ("red_cylinder", "green_cylinder", "blue_cylinder", "purple_cube", "magenta_block", "yellow_mug", "tray"):
+        for object_name in ("red_cylinder", "green_cylinder", "blue_cylinder", "purple_cube", "magenta_block", "yellow_mug", "orange_rabbit", "tray"):
             body_id = self.model.body(object_name).id
             world_from_object = np.eye(4)
             world_from_object[:3, :3] = self.data.xmat[body_id].reshape(3, 3)

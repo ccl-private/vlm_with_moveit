@@ -22,8 +22,10 @@
     <material name="cube_purple" rgba="0.60 0.08 0.78 1"/>
     <material name="block_magenta" rgba="0.88 0.05 0.72 1"/>
     <material name="mug_yellow" rgba="0.92 0.62 0.06 1" emission="0.35"/>
+    <material name="rabbit_orange" rgba="0.95 0.26 0.04 1" emission="0.12"/>
     <!-- panda.xml 设置了 meshdir=assets，故此路径相对 panda_mjcf/assets 解析。 -->
     <mesh name="mug_handle_visual_mesh" file="../../object_models/mug_with_handle_v1.obj"/>
+    <mesh name="rabbit_ears_visual_mesh" file="../../object_models/orange_rabbit_ears_v1.obj"/>
   </asset>
 
   <worldbody>
@@ -78,6 +80,19 @@
       <geom name="yellow_mug_handle_lower_collision" type="capsule" fromto="0 0.033 -0.034 0 0.074 -0.028" size="0.006" mass="0.001" friction="1.2 0.01 0.001" margin="0.001"/>
     </body>
 
+    <!-- 通用 mesh 回归对象：非对称刚体兔子。抓取标注只允许夹住长耳朵的
+         外侧相对面；视觉网格与独立耳部碰撞盒保持同一 CAD 局部坐标系。 -->
+    <body name="orange_rabbit" pos="0.28 -0.40 0.505">
+      <freejoint name="orange_rabbit_freejoint"/>
+      <geom name="orange_rabbit_visual" type="mesh" mesh="rabbit_ears_visual_mesh" material="rabbit_orange" contype="0" conaffinity="0" group="2"/>
+      <!-- CAD 由相同椭球与独立耳盒生成；耳间空隙保留，不允许跨空隙伪接触。 -->
+      <geom name="orange_rabbit_body_collision" type="ellipsoid" pos="0 0 -0.058" size="0.060 0.040 0.052" material="rabbit_orange" mass="0.23" friction="1.5 0.01 0.001" margin="0.001"/>
+      <geom name="orange_rabbit_head_collision" type="ellipsoid" pos="-0.030 0 0.010" size="0.024 0.031 0.037" material="rabbit_orange" mass="0.02" friction="1.2 0.01 0.001" margin="0.001"/>
+      <geom name="orange_rabbit_long_ear_collision" type="box" pos="-0.014 0 0.075" size="0.010 0.012 0.035" material="rabbit_orange" mass="0.006" friction="1.8 0.01 0.001" margin="0.001"/>
+      <geom name="orange_rabbit_short_ear_collision" type="box" pos="0.016 0 0.0565" size="0.010 0.012 0.0215" material="rabbit_orange" mass="0.004" friction="1.8 0.01 0.001" margin="0.001"/>
+      <geom name="orange_rabbit_tail_collision" type="sphere" pos="0.071 0 -0.055" size="0.020" material="rabbit_orange" mass="0.005" friction="1.2 0.01 0.001" margin="0.001"/>
+    </body>
+
     <!-- 托盘底板半厚为 12 mm，中心 z=0.407，使底板直接置于桌面 z=0.395。 -->
     <body name="tray" pos="0.48 0.18 0.407">
       <geom name="tray_base" type="box" size="0.13 0.11 0.012" material="tray_material"/>
@@ -102,10 +117,12 @@
     <weld name="grasp_purple_cube" body1="hand" body2="purple_cube" active="false" solref="0.05 1" solimp="0.90 0.98 0.001"/>
     <weld name="grasp_magenta_block" body1="hand" body2="magenta_block" active="false" solref="0.05 1" solimp="0.90 0.98 0.001"/>
     <weld name="grasp_yellow_mug" body1="hand" body2="yellow_mug" active="false" solref="0.05 1" solimp="0.90 0.98 0.001"/>
+    <weld name="grasp_orange_rabbit" body1="hand" body2="orange_rabbit" active="false" solref="0.05 1" solimp="0.90 0.98 0.001"/>
     <!-- 仅用于视觉与预抓取规划期间锁住长方体；最终接近前解除，避免目标在重力下漂移。 -->
     <weld name="magenta_block_rest" body1="table" body2="magenta_block" active="true" solref="0.01 1" solimp="0.95 0.99 0.0001"/>
     <!-- 仅用于场景静置：视觉帧、MoveIt 预抓取规划期间锁住桌面上的杯子；接近前立即解除。 -->
     <weld name="yellow_mug_rest" body1="table" body2="yellow_mug" active="true" solref="0.01 1" solimp="0.95 0.99 0.0001"/>
+    <weld name="orange_rabbit_rest" body1="table" body2="orange_rabbit" active="true" solref="0.01 1" solimp="0.95 0.99 0.0001"/>
   </equality>
 
 </mujoco>

@@ -120,7 +120,11 @@ def _attached_pose_in_hand(
     hand_position_base: np.ndarray,
     hand_orientation_xyzw: np.ndarray,
 ) -> Pose:
-    hand_rotation = _quaternion_to_matrix(hand_orientation_xyzw)
+    # 请求朝向属于 panda_link8；附着碰撞体却表达在 panda_hand。
+    # 两者存在固定 -45° 手爪安装转角，必须与真实 MuJoCo 抓取关系一致。
+    angle = -np.pi / 4.0
+    hand_mount_rotation = np.array([[np.cos(angle), -np.sin(angle), 0.], [np.sin(angle), np.cos(angle), 0.], [0., 0., 1.]])
+    hand_rotation = _quaternion_to_matrix(hand_orientation_xyzw) @ hand_mount_rotation
     relative_rotation = hand_rotation.T @ object_rotation_base
     relative_position = hand_rotation.T @ (object_position_base - hand_position_base)
     pose = Pose()
@@ -322,8 +326,8 @@ def main() -> None:
     parser.add_argument(
         "--attached-speed-scale",
         type=float,
-        default=6.0,
-        help="夹住物体后的轨迹时长倍率，默认 6.0；数值越小越快。",
+        default=2.0,
+        help="夹住物体后的轨迹时长倍率，默认 2.0；数值越小越快。",
     )
     arguments = parser.parse_args()
     if arguments.max_wrist_observations <= 0:
@@ -756,8 +760,8 @@ def main() -> None:
                 # 先到物体中心上方的中性安全观察位；ROI 在腕部画面中锁定两片
                 # 接触面后，on-path 分支会重新生成真正的把手抓取位。
                 candidates = [
-                    (template, pose.position_base_m.copy(), orientation)
-                    for template, _position, orientation in candidates
+                    (template, pose.position_base_m + np.array([0.0, 0.0, position[2] - pose.position_base_m[2]]), orientation)
+                    for template, position, orientation in candidates
                 ]
             # 对 mesh sweep，候选不是“任意偏转的 IK 搜索”：每个 pose 都已经
             # 在 GraspRoiMatcher 中重新满足了两片对向接触面的支持和残差门禁。
@@ -773,8 +777,8 @@ def main() -> None:
             ]
             if model.geometry_type == "mesh" and arguments.active_observation and arguments.active_observation_mode == "on_path":
                 candidate_records = [
-                    (candidate_template, pose.position_base_m.copy(), candidate_orientation, pose)
-                    for candidate_template, _candidate_position, candidate_orientation, _candidate_pose in candidate_records
+                    (candidate_template, pose.position_base_m + np.array([0.0, 0.0, candidate_position[2] - pose.position_base_m[2]]), candidate_orientation, pose)
+                    for candidate_template, candidate_position, candidate_orientation, _candidate_pose in candidate_records
                 ]
             # 横向把手抓取框（手腕绕工具 Z 旋转 90°）下，MoveIt ``panda_hand``
             # 参考点相对 MuJoCo 指尖工作点低约 82 mm，故目标参考点须向上补偿。
@@ -913,7 +917,7 @@ def main() -> None:
                 maximum_observation_hand_travel_m = 0.055
                 selected_camera_positions: list[np.ndarray] = []
                 covered_contact_indices: set[int] = set()
-                maximum_wrist_observations = min(3, arguments.max_wrist_observations)
+                maximum_wrist_observations = arguments.max_wrist_observations
                 for observation_index in range(maximum_wrist_observations):
                     current_hand_position = executor.body_position("hand")
                     current_wrist_frame = simulation.cameras(("wrist",))["wrist"]
@@ -934,6 +938,8 @@ def main() -> None:
                         covered_contact_indices,
                         current_hand_position,
                     )
+                    if observation_index >= 2:
+                        ranked_local_views.sort(key=lambda view: ("_roll_+15" not in view.view_id, view.view_id))
                     # 专用 matcher 已有可靠把手方向，粗预抓取位就是第一条安全
                     # 近距观察位。mesh 的粗 yaw 尚未可信，首帧便应开始横向扫描，
                     # 避免把 3 帧预算浪费在假想把手方向的原地画面。
@@ -979,7 +985,7 @@ def main() -> None:
                     # 观察位会有明显的腕部转向；采用低于常规 1.7 倍的温和加速，
                     # 在保持跟踪裕量的同时避免为一次局部观测等待完整原始轨迹时长。
                     if observation_trajectory is not None:
-                        _execute_trajectory(executor, observation_trajectory, speed_scale=1.25)
+                        _execute_trajectory(executor, observation_trajectory, speed_scale=1.0)
                     executor._event(
                         "on_path_wrist_observation_complete",
                         view_id=observation_view.view_id,
@@ -1283,15 +1289,20 @@ def main() -> None:
             # 而不是把第一次闭合失败直接解释为“视觉可以任意猜”。腕部重观测后
             # 仍可能留下约 1 cm 横向误差，故沿夹爪闭合轴覆盖 ±12 mm、沿把手
             # 径向覆盖 ±4 mm；每一次都必须通过同一对真实碰撞面的双侧接触门禁。
-            if target_object_id == "yellow_mug":
-                grasp_search_offsets_object = tuple(
-                    np.array([closing_offset, radial_offset, 0.0])
-                    for closing_offset in (0.0, -0.006, 0.006, -0.012, 0.012)
-                    for radial_offset in (0.0, 0.004, -0.004)
-                )
-            else:
-                grasp_search_offsets_object = (np.zeros(3),)
-            max_grasp_attempts = 12 if target_object_id == "magenta_block" else len(grasp_search_offsets_object)
+            closing_axis = template.jaw_closing_axis_object / np.linalg.norm(template.jaw_closing_axis_object)
+            tangent_axis = np.cross(np.array([0.0, 0.0, 1.0]), closing_axis)
+            if np.linalg.norm(tangent_axis) < 1e-6:
+                tangent_axis = np.cross(np.array([1.0, 0.0, 0.0]), closing_axis)
+            tangent_axis /= np.linalg.norm(tangent_axis)
+            pair = template.opposing_contact_pair
+            separation = float(np.linalg.norm(pair.positive_surface.center_object_m - pair.negative_surface.center_object_m))
+            step = min(0.006, separation / 2.0)
+            grasp_search_offsets_object = tuple(
+                closing_offset * closing_axis + tangent_offset * tangent_axis
+                for closing_offset in (0.0, -step, step, -2.0 * step, 2.0 * step)
+                for tangent_offset in (0.0, 0.004, -0.004)
+            )
+            max_grasp_attempts = len(grasp_search_offsets_object)
             for attempt in range(1, max_grasp_attempts + 1):
                 offset_object = grasp_search_offsets_object[min(attempt - 1, len(grasp_search_offsets_object) - 1)]
                 attempt_grasp_position = grasp_position + pose.transform_base_object[:3, :3] @ offset_object
@@ -1316,7 +1327,7 @@ def main() -> None:
                             attempt=attempt,
                             reason=str(error),
                         )
-                        if target_object_id == "yellow_mug" and attempt < max_grasp_attempts:
+                        if attempt < max_grasp_attempts:
                             # 这是同一经 ROI 验证的夹持框内、有限集合中的一个
                             # 微调点无 IK 解；保持在上一次安全预抓取位并继续验证
                             # 其它微调点，而非把一个局部不可达点错误升级为视觉失败。
@@ -1430,14 +1441,8 @@ def main() -> None:
                         ),
                         required_object_geometries=template.contact_collision_geometries,
                     )
-                    if target_object_id == "yellow_mug":
-                        # ``attach`` 已确认不只是接触而且两指分别处于 CAD 标注的
-                        # 相对面，至此才可解除静置。若该验证失败，杯子必须保持在
-                        # 原位供下一次毫米级受限搜索使用。
-                        simulation.data.eq_active[simulation.model.equality("yellow_mug_rest").id] = 0
-                        import mujoco
-                        mujoco.mj_forward(simulation.model, simulation.data)
-                        print("[场景静置] 双侧接触与相对面验证已确认，解除 yellow_mug_rest", flush=True)
+                    simulation.release_object_rest(target_object_id)
+                    print("[场景静置] 双侧接触与 CAD 相对面验证已确认，解除目标静置约束", flush=True)
                     # 后续抬升、放置和物体在手坐标系中的相对位姿必须使用真正
                     # 通过接触验证的微调抓取位，而不是初始视觉候选。
                     grasp_position = attempt_grasp_position
@@ -1451,7 +1456,7 @@ def main() -> None:
                         attempt=attempt,
                         reason=str(error),
                     )
-                    if target_object_id == "yellow_mug" and attempt < max_grasp_attempts:
+                    if attempt < max_grasp_attempts:
                         # 与预抓取相同：不重采样场景、不放宽 ROI，只跳过这个
                         # MoveIt 已明确拒绝的毫米级接触候选。
                         print(
@@ -1464,7 +1469,7 @@ def main() -> None:
                         "这不是双侧接触失败，不继续枚举夹持偏移"
                     ) from error
                 except RuntimeError as error:
-                    if target_object_id not in {"magenta_block", "yellow_mug"} or attempt == max_grasp_attempts:
+                    if attempt == max_grasp_attempts:
                         raise
                     if approach_trajectory is not None:
                         # 闭合失败后夹爪可能正与目标接触。先沿刚刚验证过的轨迹
@@ -1482,17 +1487,13 @@ def main() -> None:
                     )
             if not grasp_confirmed:
                 raise RuntimeError(f"{target_object_id} 在 {max_grasp_attempts} 次真实抓取重试后仍未形成双侧接触")
-            if target_object_id == "magenta_block":
-                simulation.data.eq_active[simulation.model.equality("magenta_block_rest").id] = 0
-                import mujoco
-                mujoco.mj_forward(simulation.model, simulation.data)
-                print("[场景静置] 已解除 magenta_block_rest，双侧接触已确认", flush=True)
             attached_pose = _attached_pose_in_hand(
                 pose.position_base_m,
                 pose.transform_base_object[:3, :3],
                 moveit_grasp_position,
                 grasp_orientation,
             )
+            object_grasp_offset = pose.transform_base_object[:3, :3].T @ (grasp_position - pose.position_base_m)
             for stage, target in targets[1:]:
                 executor.set_display_state(f"CAD grasp / MoveIt: {stage} with {target_object_id}")
                 phase = PlanningPhase.PLACE if stage.startswith("place") else PlanningPhase.TRANSPORT
@@ -1504,17 +1505,35 @@ def main() -> None:
                 )
                 client.publish_joint_state(executor.joint_positions())
                 time.sleep(0.25)
-                try:
-                    _execute_trajectory(
-                        executor,
-                        client.request(
-                            target,
-                            grasp_orientation,
-                        ),
-                    )
-                except TimeoutError as error:
-                    print(f"[MoveIt 阶段失败] 阶段={stage}；原因={error}", flush=True)
-                    raise
+                transport_trajectory = None
+                last_transport_error = None
+                # 物体已夹持后可整体小幅转向；物体与夹爪的相对抓取关系保持
+                # 固定。所有 CAD 使用同一组有限候选，逐项做完整碰撞规划。
+                for yaw_delta_deg in (0., -5., 5., -10., 10.):
+                    candidate_pose = _pose_with_local_z_yaw(pose, np.deg2rad(yaw_delta_deg))
+                    _, _, candidate_orientation = grasp_pose_candidates(candidate_pose, (template,))[0]
+                    candidate_tcp = _rotate_vector_by_quaternion(np.array([0., 0., -0.082]), candidate_orientation)
+                    candidate_placement = catalog.physical_placement_targets(model, template, candidate_pose.transform_base_object[:3, :3])
+                    if stage == "lift":
+                        object_center = pose.position_base_m + np.array([0., 0., template.lift_clearance_m])
+                    elif stage == "place_above":
+                        object_center = candidate_placement.object_release_center_base_m + np.array([0., 0., candidate_placement.gripper_above_base_m[2] - candidate_placement.gripper_release_base_m[2]])
+                    else:
+                        object_center = candidate_placement.object_release_center_base_m
+                    candidate_target = object_center + candidate_pose.transform_base_object[:3, :3] @ object_grasp_offset + candidate_tcp
+                    try:
+                        transport_trajectory = client.request(candidate_target, candidate_orientation)
+                    except TimeoutError as error:
+                        last_transport_error = error
+                        continue
+                    pose = candidate_pose
+                    grasp_orientation = candidate_orientation
+                    placement = candidate_placement
+                    executor._event("transport_orientation_selected", stage=stage, local_yaw_offset_deg=yaw_delta_deg)
+                    break
+                if transport_trajectory is None:
+                    raise RuntimeError(f"通用搬运阶段 {stage} 的全部姿态候选不可达：{last_transport_error}")
+                _execute_trajectory(executor, transport_trajectory)
                 executor._event(
                     f"moveit_{stage}_complete",
                     hand_x=float(executor.body_position("hand")[0]),

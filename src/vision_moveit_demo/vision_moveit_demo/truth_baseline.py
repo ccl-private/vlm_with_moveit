@@ -10,10 +10,12 @@ from pathlib import Path
 import numpy as np
 import rclpy
 from geometry_msgs.msg import Pose, PoseStamped
-from moveit_msgs.msg import AttachedCollisionObject, CollisionObject, PlanningScene, RobotTrajectory
+from moveit_msgs.msg import AttachedCollisionObject, CollisionObject, PlanningScene, PlanningSceneComponents, RobotTrajectory
+from moveit_msgs.srv import GetPositionIK, GetPlanningScene
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
+from std_msgs.msg import String
 
 from .stage2_executor import MujocoTaskExecutor
 from .unified_scene import UnifiedPandaCupSimulation
@@ -27,9 +29,26 @@ class MoveItTrajectoryClient(Node):
         self.scene_publisher = self.create_publisher(PlanningScene, "/vision_moveit/planning_scene_diff", 10)
         self.joint_publisher = self.create_publisher(JointState, "/vision_moveit/sim_joint_states", 10)
         self.trajectories: list[RobotTrajectory] = []
+        self.planning_statuses: list[str] = []
+        self.ik_client = self.create_client(GetPositionIK, "/compute_ik")
+        self.latest_joint_message: JointState | None = None
         self._published_world_object_ids: set[str] = set()
         self._published_attached_object_ids: set[str] = set()
         self.create_subscription(RobotTrajectory, "/vision_moveit/planned_trajectory", self.trajectories.append, 10)
+        self.create_subscription(String, "/vision_moveit/planning_status", lambda message: self.planning_statuses.append(message.data), 10)
+        scene_client = self.create_client(GetPlanningScene, "/get_planning_scene")
+        if scene_client.wait_for_service(timeout_sec=2.0):
+            query = GetPlanningScene.Request()
+            query.components.components = PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+            future = scene_client.call_async(query)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+            if future.done() and future.result() is not None:
+                self._published_attached_object_ids = {
+                    item.object.id for item in future.result().scene.robot_state.attached_collision_objects
+                    if item.object.id.startswith("stage2_")
+                }
+                if self._published_attached_object_ids:
+                    print(f"[场景同步] 下一次发布将清理前一回合的附着碰撞体：{sorted(self._published_attached_object_ids)}", flush=True)
 
     def publish_joint_state(self, positions: dict[str, float]) -> None:
         message = JointState()
@@ -56,6 +75,7 @@ class MoveItTrajectoryClient(Node):
             for index, (lower, upper) in enumerate(joint_limits, start=1)
         ]
         self.joint_publisher.publish(message)
+        self.latest_joint_message = message
 
     def publish_scene(self, snapshot, grasp_target: str | None = None) -> None:
         positions = {name: value["position_base_m"] for name, value in snapshot.planning_scene_objects.items()}
@@ -72,6 +92,7 @@ class MoveItTrajectoryClient(Node):
     ) -> None:
         """发布显式场景坐标；视觉闭环调用方不得传入 MuJoCo 真值快照。"""
         scene = PlanningScene(is_diff=True)
+        scene.robot_state.is_diff = True
         dimensions = {
             # Panda 基座安装在桌面边缘。MoveIt 场景仅放入基座前方的作业台面，
             # 否则完整桌板会与其固定底座/立柱相交，使起始状态非法。
@@ -85,6 +106,9 @@ class MoveItTrajectoryClient(Node):
             # 预抓取阶段只需阻止路径横穿杯身。用实际杯身圆柱而非包住把手
             # 与空腔的实心大盒，避免在把手上方的合法预抓取位被误判为碰撞。
             "yellow_mug": (SolidPrimitive.CYLINDER, [0.10, 0.033]),
+            # Rabbit is intentionally a conservative box in MoveIt while
+            # RGB-D/CAD matching still uses its full asymmetric mesh.
+            "orange_rabbit": (SolidPrimitive.BOX, [0.151, 0.080, 0.220]),
         }
         # 任务脚本每回合启动独立的规划服务。这里直接省略目标和临时排除件即可；
         # 不能对一个尚不存在的 CollisionObject 发 REMOVE，否则 MoveIt 会拒绝
@@ -144,6 +168,7 @@ class MoveItTrajectoryClient(Node):
             attached.operation = CollisionObject.ADD
             attached_message = AttachedCollisionObject()
             attached_message.link_name = "panda_hand"
+            attached_message.touch_links = ["panda_hand", "panda_leftfinger", "panda_rightfinger"]
             attached_message.object = attached
             scene.robot_state.attached_collision_objects.append(attached_message)
         self.scene_publisher.publish(scene)
@@ -193,12 +218,29 @@ class MoveItTrajectoryClient(Node):
         # 串行任务在发送前清空已处理轨迹；部分 ROS 发行版会重写 trajectory header
         # 的时间戳，故不能把它作为唯一关联键。
         self.trajectories.clear()
+        self.planning_statuses.clear()
+        if not position_only and self.latest_joint_message is not None and self.ik_client.service_is_ready():
+            check = GetPositionIK.Request()
+            check.ik_request.group_name = "panda_arm"
+            check.ik_request.ik_link_name = "panda_link8"
+            check.ik_request.pose_stamped = target
+            check.ik_request.robot_state.is_diff = True
+            check.ik_request.robot_state.joint_state = self.latest_joint_message
+            check.ik_request.avoid_collisions = True
+            check.ik_request.timeout.nanosec = 200000000
+            future = self.ik_client.call_async(check)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=1.0)
+            if future.done() and future.result() is not None and future.result().error_code.val != 1:
+                print(f"[MoveIt 快速预检] 目标无有效 IK/碰撞解，错误码={future.result().error_code.val}，跳过长时间规划", flush=True)
+                raise TimeoutError("目标未通过快速 IK/碰撞预检")
         self.trajectory_publisher.publish(target)
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
             if self.trajectories:
                 return self.trajectories[-1]
+            if any("规划失败" in status for status in self.planning_statuses):
+                raise TimeoutError("MoveIt 已明确拒绝该目标位姿，请检查 IK/碰撞约束")
         raise TimeoutError(
             "等待 MoveIt 规划轨迹超时；请查看同一终端中紧邻的 [MoveIt 请求] 目标位姿，"
             "以及 VNC 启动脚本随后打印的 MoveIt 服务末尾日志（其中包含 GOAL_STATE_INVALID、碰撞或 IK 原因）"
@@ -209,7 +251,7 @@ def _execute_trajectory(
     executor: MujocoTaskExecutor,
     trajectory: RobotTrajectory,
     *,
-    speed_scale: float = 1.70,
+    speed_scale: float = 1.0,
 ) -> None:
     """执行 MoveIt 轨迹；局部视觉微动可显式降低速度以保证跟踪裕量。"""
     names = trajectory.joint_trajectory.joint_names

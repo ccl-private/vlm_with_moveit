@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import time
+import queue
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +41,10 @@ class _Mp4Recorder:
     def __init__(self, path: Path, width: int, height: int, fps: int = 30) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
+        self.fps = fps
+        self.wall_start: float | None = None
+        self.frame_count = 0
+        self.last_frame: bytes | None = None
         self.process = subprocess.Popen(
             [
                 "ffmpeg",
@@ -66,22 +72,58 @@ class _Mp4Recorder:
             ],
             stdin=subprocess.PIPE,
         )
+        self.pending_frames: queue.SimpleQueue = queue.SimpleQueue()
+        self.recording_error: Exception | None = None
+        self.worker = threading.Thread(target=self._encode_frames, daemon=True)
+        self.worker.start()
+
+    def _encode_frames(self) -> None:
+        try:
+            while True:
+                item = self.pending_frames.get()
+                if item is None:
+                    break
+                self._write_frame(*item)
+        except Exception as error:
+            self.recording_error = error
 
     def write(self, rgb: np.ndarray) -> None:
+        if self.recording_error is not None:
+            raise RuntimeError(f"视频编码失败：{self.path}") from self.recording_error
+        frame = np.ascontiguousarray(rgb, dtype=np.uint8).tobytes()
+        self.pending_frames.put((frame, time.monotonic()))
+
+    def _write_frame(self, frame: bytes, now: float) -> None:
         if self.process.stdin is None:
             raise RuntimeError(f"视频录制管道不可用：{self.path}")
-        frame = np.ascontiguousarray(rgb, dtype=np.uint8)
         try:
-            self.process.stdin.write(frame.tobytes())
+            if self.wall_start is None:
+                self.wall_start = now
+            desired_count = int((now - self.wall_start) * self.fps) + 1
+            if self.frame_count >= desired_count:
+                self.last_frame = frame
+                return
+            # 记录实际墙钟节奏，保留规划等待与渲染停顿；不把低帧率执行
+            # 压缩成看似更快的固定 30 FPS 视频。
+            while self.last_frame is not None and self.frame_count < desired_count - 1:
+                self.process.stdin.write(self.last_frame)
+                self.frame_count += 1
+            self.last_frame = frame
+            self.process.stdin.write(self.last_frame)
+            self.frame_count += 1
         except BrokenPipeError as error:
             raise RuntimeError(f"ffmpeg 无法写入视频：{self.path}") from error
 
     def close(self) -> None:
+        self.pending_frames.put(None)
+        self.worker.join()
         if self.process.stdin is not None:
             self.process.stdin.close()
         return_code = self.process.wait()
         if return_code != 0:
             raise RuntimeError(f"ffmpeg 录制失败（退出码 {return_code}）：{self.path}")
+        if self.recording_error is not None:
+            raise RuntimeError(f"视频编码失败：{self.path}") from self.recording_error
 
 
 def _save_stage1_snapshot(path: Path, simulation: UnifiedPandaCupSimulation) -> None:
@@ -140,7 +182,7 @@ class VncOverlayViewer:
             glfw.terminate()
             raise RuntimeError("无法创建 MuJoCo VNC 窗口。")
         glfw.make_context_current(self.window)
-        glfw.swap_interval(1)
+        glfw.swap_interval(0)
         glfw.show_window(self.window)
         glfw.focus_window(self.window)
         self.wrist_window = glfw.create_window(480, 360, f"{title}：腕部 RGB-D 相机", None, None)
@@ -149,7 +191,7 @@ class VncOverlayViewer:
             glfw.terminate()
             raise RuntimeError("无法创建腕部相机窗口。")
         glfw.make_context_current(self.wrist_window)
-        glfw.swap_interval(1)
+        glfw.swap_interval(0)
         glfw.set_window_pos(self.wrist_window, 24, 80)
         glfw.show_window(self.wrist_window)
         self.wrist_context = mujoco.MjrContext(simulation.model, mujoco.mjtFontScale.mjFONTSCALE_150)
@@ -163,6 +205,9 @@ class VncOverlayViewer:
         self.scene = mujoco.MjvScene(simulation.model, maxgeom=2000)
         self.context = mujoco.MjrContext(simulation.model, mujoco.mjtFontScale.mjFONTSCALE_150)
         self.show_depth = False
+        self._fixed_preview_frame = None
+        self._fixed_preview_time = 0.0
+        self._fixed_preview_depth = False
         self.editor_active = False
         self._editor_confirmed = False
         self._editor_selected_index = 0
@@ -274,9 +319,17 @@ class VncOverlayViewer:
         # 复用感知链已创建的渲染器。VirtualGL 下若额外创建离屏 renderer，跨两个
         # GLFW 窗口的纹理上下文会变成全黑；此处只取两路所需 RGB（D 键才取深度）。
         self.glfw.make_context_current(self.window)
-        frames = self.simulation.cameras(("global", "fixed", "wrist"), include_depth=self.show_depth)
+        now = time.monotonic()
+        refresh_fixed = (self._fixed_preview_frame is None or now - self._fixed_preview_time >= 0.5
+                         or self._fixed_preview_depth != self.show_depth)
+        names = ("global", "wrist", "fixed") if refresh_fixed else ("global", "wrist")
+        frames = self.simulation.cameras(names, include_depth=self.show_depth)
+        if refresh_fixed:
+            self._fixed_preview_frame = frames["fixed"]
+            self._fixed_preview_time = now
+            self._fixed_preview_depth = self.show_depth
         global_rgb = frames["global"].rgb if not self.show_depth else _depth_rgb(frames["global"].depth)
-        fixed = _depth_rgb(frames["fixed"].depth) if self.show_depth else frames["fixed"].rgb
+        fixed = _depth_rgb(self._fixed_preview_frame.depth) if self.show_depth else self._fixed_preview_frame.rgb
         wrist = _depth_rgb(frames["wrist"].depth) if self.show_depth else frames["wrist"].rgb
         if self.video_recorders is not None:
             main_video = global_rgb.copy()

@@ -74,14 +74,14 @@ class MujocoTaskExecutor:
     """阶段 2 的唯一 MuJoCo 执行入口；夹取附着与事件在此原子处理。"""
 
     arm_joint_names = tuple(f"joint{index}" for index in range(1, 8))
-    graspable_object_names = ("red_cylinder", "green_cylinder", "blue_cylinder", "purple_cube", "magenta_block", "yellow_mug")
+    graspable_object_names = ("red_cylinder", "green_cylinder", "blue_cylinder", "purple_cube", "magenta_block", "yellow_mug", "orange_rabbit")
 
     def __init__(
         self,
         simulation: UnifiedPandaCupSimulation,
         frame_callback: Callable[[str], bool] | None = None,
         realtime_factor: float | None = None,
-        attached_speed_scale: float = 6.0,
+        attached_speed_scale: float = 2.0,
     ) -> None:
         if realtime_factor is not None and realtime_factor <= 0.0:
             raise ValueError("实时回放倍率必须为正数或 None")
@@ -92,7 +92,8 @@ class MujocoTaskExecutor:
         self.events: list[SimulationEvent] = []
         self.frame_callback = frame_callback
         self.display_state = "Preparing"
-        self._render_interval_steps = max(1, int(round(1.0 / (30.0 * simulation.model.opt.timestep))))
+        # GUI 以 20 Hz 更新；物理步仍为 500 Hz，录像按墙钟补齐 30 FPS。
+        self._render_interval_steps = max(1, int(round(1.0 / (20.0 * simulation.model.opt.timestep))))
         self.realtime_factor = realtime_factor
         self.attached_speed_scale = attached_speed_scale
         self._realtime_wall_origin: float | None = None
@@ -209,7 +210,11 @@ class MujocoTaskExecutor:
         commanded_duration_s = 0.0
         max_tracking_error = 0.0
 
-        for waypoint_time_s, waypoint in zip(waypoint_times_s, waypoint_positions):
+        wall_start = time.monotonic()
+        next_progress_wall = wall_start + 2.0
+        print(f"[轨迹开始] 状态={self.display_state}，MoveIt 时长={waypoint_times_s[-1]:.2f}s，路点={len(waypoint_times_s)}，携物时长倍率={self.attached_speed_scale if self.attached_object else 1.0:.1f}", flush=True)
+
+        for waypoint_index, (waypoint_time_s, waypoint) in enumerate(zip(waypoint_times_s, waypoint_positions)):
             target_positions = np.array([waypoint[name] for name in self.arm_joint_names])
             raw_duration_s = max(0.0, waypoint_time_s - previous_time_s)
             speed_limited_duration_s = max(
@@ -234,9 +239,13 @@ class MujocoTaskExecutor:
             commanded_duration_s += effective_duration_s
             previous_positions = target_positions
             previous_time_s = waypoint_time_s
+            if time.monotonic() >= next_progress_wall:
+                print(f"[轨迹进度] {100 * (waypoint_index + 1) / len(waypoint_times_s):.0f}%；实际耗时={time.monotonic() - wall_start:.1f}s；最大跟踪误差={max_tracking_error:.4f}rad", flush=True)
+                next_progress_wall = time.monotonic() + 2.0
 
         final_positions = np.array([self.joint_positions()[name] for name in self.arm_joint_names])
         final_tracking_error = float(np.max(np.abs(previous_positions - final_positions)))
+        print(f"[轨迹完成] 实际耗时={time.monotonic() - wall_start:.2f}s；仿真时长={commanded_duration_s:.2f}s；最大跟踪误差={max_tracking_error:.4f}rad", flush=True)
         summary = TrajectoryExecutionSummary(
             profile=profile,
             waypoint_count=len(waypoint_positions),

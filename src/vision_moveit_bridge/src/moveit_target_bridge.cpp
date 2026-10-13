@@ -37,6 +37,10 @@ class MoveItTargetBridge : public rclcpp::Node {
         shared_from_this(), "panda_arm");
     move_group_->setPoseReferenceFrame("panda_link0");
     move_group_->setPlanningTime(5.0);
+    // 仿真使用明确的统一时间参数化；避免 MoveIt 默认 0.1 倍速度
+    // 再与执行器的携物降速叠加，使一次短抬升耗时一分钟以上。
+    move_group_->setMaxVelocityScalingFactor(0.5);
+    move_group_->setMaxAccelerationScalingFactor(0.5);
     publish_status("规划桥已就绪，等待 /vision_moveit/target_pose");
   }
 

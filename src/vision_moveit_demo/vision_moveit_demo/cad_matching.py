@@ -52,6 +52,7 @@ class RuleVlmAdapter:
         "紫色": ("purple", "block", "box_cube_v1", ("方块", "正方体", "立方体")),
         "洋红色": ("magenta", "block", "rectangular_block_v1", ("方块", "长方体", "长条")),
         "黄色": ("yellow", "mug", "mug_with_handle_v1", ("马克杯", "带把手杯")),
+        "橙色": ("orange", "rabbit", "orange_rabbit_ears_v1", ("兔子", "小兔", "兔兔")),
     }
 
     def infer(self, instruction: str) -> TaskIntent:
@@ -72,6 +73,10 @@ class RuleVlmAdapter:
             if "把手" not in instruction:
                 raise ValueError("马克杯基线必须明确要求抓取“把手”，不允许退化为夹杯身")
             grasp_region = "handle"
+        if category == "rabbit":
+            if "耳朵" not in instruction:
+                raise ValueError("兔子基线必须明确要求抓取“耳朵”，不允许退化为夹身体")
+            grasp_region = "ears"
         return TaskIntent(
             task="pick_and_place",
             target_category=category,
@@ -196,7 +201,9 @@ class ColorThresholdSegmenter:
             "magenta": (red > 115) & (blue > 95) & (green < 105) & (red > green * 1.35) & (blue > green * 1.35),
             # 只取黄色杯子网格（杯身和把手），不把独立的绿色圆柱混入。旧版绿色
             # 定位贴已移除；仅依赖最大连通域会令离相机更近的绿色圆柱被误识别为马克杯。
-            "yellow": (red > 120) & (green > 75) & (blue < 38) & (red > green * 1.15) & (green > blue * 2.2),
+            "yellow": (red > 120) & (green > 75) & (blue < 38) & (red > green * 1.15) & (red <= green * 1.75) & (green > blue * 2.2),
+            # 橙色兔子采用高饱和橙色，刻意避开棕色桌面、红色圆柱和黄色马克杯。
+            "orange": (red > 165) & (green > 45) & (green < 125) & (blue < 75) & (red > green * 1.75),
         }
         candidate = selectors[intent.target_color]
         source = "hsv_like_color_threshold"
@@ -234,6 +241,7 @@ class ContactSurface:
     region_id: str
     normal_object: np.ndarray
     center_object_m: np.ndarray
+    patch_radius_m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -519,7 +527,10 @@ class ObjectCatalog:
             # CAD 原点不一定在包围盒中心；例如马克杯杯身原点居中、把手只向 +Y 延伸。
             if np.any(center < bounds_min_m - 1e-6) or np.any(center > bounds_max_m + 1e-6):
                 raise ValueError(f"抓取标注的 {key} 中心超出 CAD 包围盒")
-            return ContactSurface(region_id, normal / norm, center)
+            radius = surface.get("patch_radius_m")
+            if radius is not None and (not np.isfinite(float(radius)) or float(radius) <= 0.0):
+                raise ValueError(f"抓取标注的 {key} patch_radius_m 必须为正数")
+            return ContactSurface(region_id, normal / norm, center, float(radius) if radius is not None else None)
 
         positive = load_surface("positive_surface")
         negative = load_surface("negative_surface")
@@ -1593,7 +1604,7 @@ class GenericMeshCadMatcher:
             observed_center = (np.min(points, axis=0) + np.max(points, axis=0)) / 2.0
             vertical_alignment = float(np.dot(estimate.transform_base_object[:3, 2], np.array([0.0, 0.0, 1.0])))
             center_error = float(np.linalg.norm(estimate.position_base_m - observed_center))
-            if vertical_alignment < 0.94 or center_error > 0.030:
+            if vertical_alignment < 0.99 or center_error > 0.030:
                 raise RuntimeError(
                     "固定相机 FPFH 全局 pose 不满足桌面粗定位一致性："
                     f"竖直对齐={vertical_alignment:.3f}，中心偏差={center_error:.4f}m"
@@ -1676,14 +1687,24 @@ class GraspRoiMatcher:
         thin normal slab plus a height-scaled tangent envelope works for any
         CAD carrying the existing generic contact-pair schema.
         """
-        delta = model.vertices_object_m - surface.center_object_m
+        vertices = model.vertices_object_m
+        if surface.patch_radius_m is not None:
+            triangles = vertices[model.triangles_object]
+            areas = np.linalg.norm(np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1)
+            generator = np.random.default_rng(20261013)
+            indices = generator.choice(len(triangles), 12000, p=areas / areas.sum())
+            u, v = generator.random((2, len(indices)))
+            root = np.sqrt(u)
+            weights = np.column_stack((1.0 - root, root * (1.0 - v), root * v))
+            vertices = np.concatenate((vertices, (triangles[indices] * weights[:, :, None]).sum(axis=1)))
+        delta = vertices - surface.center_object_m
         normal_distance = np.abs(delta @ surface.normal_object)
         tangent_distance = np.linalg.norm(
             delta - np.outer(delta @ surface.normal_object, surface.normal_object), axis=1
         )
         slab_m = float(np.clip(model.height_m * 0.055, 0.0035, 0.0065))
-        radius_m = float(np.clip(model.height_m * 0.38, 0.024, 0.045))
-        selected = model.vertices_object_m[(normal_distance <= slab_m) & (tangent_distance <= radius_m)]
+        radius_m = surface.patch_radius_m or float(np.clip(model.height_m * 0.38, 0.024, 0.045))
+        selected = vertices[(normal_distance <= slab_m) & (tangent_distance <= radius_m)]
         if len(selected) < 16:
             raise RuntimeError(f"抓取 ROI CAD 面采样不足：{surface.region_id} 仅有 {len(selected)} 个顶点")
         return selected[:: max(1, len(selected) // 120)]
@@ -1768,6 +1789,15 @@ class GraspRoiMatcher:
             raise RuntimeError("抓取 ROI 精配准的腕部有效点不足")
 
         candidates: list[tuple[float, np.ndarray, float, float, float, float, int, float]] = []
+        # 局部平面本身可能近似对称。以整份 CAD 对腕部观测的解释程度作为
+        # 抓取区候选的上下文约束，避免方形耳部等局部区域产生 90° 错配。
+        mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(model.vertices_object_m),
+            o3d.utility.Vector3iVector(model.triangles_object.astype(np.int32)),
+        )
+        context_scene = o3d.t.geometry.RaycastingScene()
+        context_scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+        context_observed = observed[::max(1, len(observed) // 1800)]
         for yaw_offset in np.linspace(-np.pi, np.pi, self._YAW_HYPOTHESES, endpoint=False):
             local_yaw = np.eye(4)
             local_yaw[:3, :3] = GenericMeshCadMatcher._rotation_z(float(yaw_offset))
@@ -1790,6 +1820,10 @@ class GraspRoiMatcher:
             score = 1.20 * pair_support + 0.20 * (positive_support + negative_support) - (
                 positive_residual + negative_residual
             ) / 0.030
+            object_points = (context_observed - refined[:3, 3]) @ refined[:3, :3]
+            context_distances = context_scene.compute_distance(o3d.core.Tensor(object_points.astype(np.float32))).numpy()
+            context_support = float(np.mean(context_distances <= 0.006))
+            score += 1.2 * context_support
             candidates.append((
                 score, refined, positive_support, negative_support, positive_residual,
                 negative_residual, supporting_views, float(yaw_offset),

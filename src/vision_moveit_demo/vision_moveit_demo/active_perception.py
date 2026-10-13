@@ -18,6 +18,7 @@ class ObservationView:
     camera_position_base_m: np.ndarray
     camera_orientation_base_xyzw: np.ndarray
     hand_position_base_m: np.ndarray
+    # MoveIt panda_link8 的目标朝向；MuJoCo hand 相对它绕局部 Z -45°。
     hand_orientation_base_xyzw: np.ndarray
     expected_contact_visibility: float
     visible_contact_indices: tuple[int, ...]
@@ -144,7 +145,7 @@ def generate_observation_views(
                     camera_position_base_m=camera_position,
                     camera_orientation_base_xyzw=matrix_to_quaternion(camera_rotation),
                     hand_position_base_m=hand_from_base[:3, 3],
-                    hand_orientation_base_xyzw=matrix_to_quaternion(hand_from_base[:3, :3]),
+                    hand_orientation_base_xyzw=matrix_to_quaternion(hand_from_base[:3, :3] @ _camera_roll_rotation(np.pi / 4.0)),
                     expected_contact_visibility=float(visibility.mean()),
                     visible_contact_indices=visible,
                 )
@@ -224,6 +225,21 @@ def generate_local_observation_views(
             if current_camera_rotation_base is not None
             else camera_look_at_rotation(camera_position, target)
         )
+        # 在局部步长内主动对准抓取高度，防止高位预抓取姿态的相机始终看向
+        # 物体上方。采用当前光轴的最小旋转，保留腕部滚转，单步最多转 12°。
+        focus = target.copy()
+        focus[2] = float(centers[:, 2].mean())
+        desired_forward = _normalize(focus - camera_position, "抓取区注视方向")
+        current_forward = -camera_rotation[:, 2]
+        rotation_axis = np.cross(current_forward, desired_forward)
+        sine = float(np.linalg.norm(rotation_axis))
+        if sine > 1e-8:
+            rotation_axis /= sine
+            angle = min(float(np.arctan2(sine, np.dot(current_forward, desired_forward))), np.deg2rad(12.0))
+            x, y, z = rotation_axis
+            skew = np.array([[0., -z, y], [z, 0., -x], [-y, x, 0.]])
+            correction = np.eye(3) + np.sin(angle) * skew + (1. - np.cos(angle)) * (skew @ skew)
+            camera_rotation = correction @ camera_rotation
         sight_vectors = camera_position[None, :] - centers
         sight_vectors /= np.linalg.norm(sight_vectors, axis=1, keepdims=True)
         visibility = np.clip((normals * sight_vectors).sum(axis=1), 0.0, 1.0)
@@ -238,9 +254,26 @@ def generate_local_observation_views(
                 camera_position_base_m=camera_position,
                 camera_orientation_base_xyzw=matrix_to_quaternion(camera_rotation),
                 hand_position_base_m=hand_from_base[:3, 3],
-                hand_orientation_base_xyzw=matrix_to_quaternion(hand_from_base[:3, :3]),
+                hand_orientation_base_xyzw=matrix_to_quaternion(hand_from_base[:3, :3] @ _camera_roll_rotation(np.pi / 4.0)),
                 expected_contact_visibility=float(visibility.mean()),
                 visible_contact_indices=visible,
             )
         )
+        # 光轴转向不可达时，保留原朝向；另提供小幅滚转去除夹爪自遮挡。
+        # 所有候选仍由调用方按实际手掌位移、IK 和碰撞筛选。
+        if current_camera_rotation_base is not None:
+            for roll_deg in (0.0, -15.0, 15.0):
+                alternate_rotation = np.asarray(current_camera_rotation_base) @ _camera_roll_rotation(np.deg2rad(roll_deg))
+                alternate_camera = camera_from_base.copy()
+                alternate_camera[:3, :3] = alternate_rotation
+                alternate_hand = alternate_camera @ camera_from_hand
+                views.append(ObservationView(
+                    view_id=f"local_{view_id}_roll_{roll_deg:+.0f}",
+                    camera_position_base_m=camera_position,
+                    camera_orientation_base_xyzw=matrix_to_quaternion(alternate_rotation),
+                    hand_position_base_m=alternate_hand[:3, 3],
+                    hand_orientation_base_xyzw=matrix_to_quaternion(alternate_hand[:3, :3] @ _camera_roll_rotation(np.pi / 4.0)),
+                    expected_contact_visibility=float(visibility.mean()),
+                    visible_contact_indices=visible,
+                ))
     return sorted(views, key=lambda view: (-view.expected_contact_visibility, view.view_id))

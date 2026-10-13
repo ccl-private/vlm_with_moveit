@@ -1,0 +1,31 @@
+{
+  "schema_version": 2,
+  "model_id": "orange_rabbit_ears_v1",
+  "grasp_frames": [{
+    "frame_id": "long_ear_top_pinch_v1",
+    "grasp_region": "ears",
+    "position_object_m": [-0.014, 0.0, 0.087],
+    "orientation_object_xyzw": [1.0, 0.0, 0.0, 0.0],
+    "contact_regions": ["ear_bundle_front_y", "ear_bundle_back_y"],
+    "contact_collision_geometries": ["orange_rabbit_long_ear_collision"],
+    "jaw_closing_axis_object": [0.0, 1.0, 0.0],
+    "opposing_contact_pair": {
+      "positive_surface": {
+        "region_id": "ear_bundle_front_y",
+        "normal_object": [0.0, 1.0, 0.0],
+        "center_object_m": [-0.014, 0.012, 0.087],
+        "patch_radius_m": 0.018
+      },
+      "negative_surface": {
+        "region_id": "ear_bundle_back_y",
+        "normal_object": [0.0, -1.0, 0.0],
+        "center_object_m": [-0.014, -0.012, 0.087],
+        "patch_radius_m": 0.018
+      }
+    },
+    "required_gripper_width_m": 0.032,
+    "approach_clearance_m": 0.075,
+    "lift_clearance_m": 0.14,
+    "quality": 1.0
+  }]
+}
