@@ -74,10 +74,10 @@
            与 CAD 标注的 +Y/-Y 成对夹持面一致，防止薄圆杆在单指初触时滚出夹爪。 -->
       <!-- 碰撞几何与视觉网格同为杯身 ±50 mm、把手外竖条 y=68…80 mm。
            接触边界外扩 1 mm：在视觉网格相交前开始受力，且保持原有稳定求解。 -->
-      <geom name="yellow_mug_body_collision" type="cylinder" size="0.033 0.050" mass="0.50" friction="5.0 0.01 0.001" margin="0.001" solref="0.002 1" solimp="0.98 0.99 0.0001"/>
-      <geom name="yellow_mug_handle_outer_collision" type="box" pos="0 0.074 0" size="0.006 0.006 0.028" mass="0.001" friction="1.2 0.01 0.001" margin="0.001"/>
-      <geom name="yellow_mug_handle_upper_collision" type="capsule" fromto="0 0.033 0.034 0 0.074 0.028" size="0.006" mass="0.001" friction="1.2 0.01 0.001" margin="0.001"/>
-      <geom name="yellow_mug_handle_lower_collision" type="capsule" fromto="0 0.033 -0.034 0 0.074 -0.028" size="0.006" mass="0.001" friction="1.2 0.01 0.001" margin="0.001"/>
+      <geom name="yellow_mug_body_collision" type="cylinder" size="0.033 0.050" group="3" mass="0.50" friction="5.0 0.01 0.001" margin="0.001" solref="0.002 1" solimp="0.98 0.99 0.0001"/>
+      <geom name="yellow_mug_handle_outer_collision" type="box" pos="0 0.074 0" size="0.006 0.006 0.028" group="3" mass="0.001" friction="1.2 0.01 0.001" margin="0.001"/>
+      <geom name="yellow_mug_handle_upper_collision" type="capsule" fromto="0 0.033 0.034 0 0.074 0.028" size="0.006" group="3" mass="0.001" friction="1.2 0.01 0.001" margin="0.001"/>
+      <geom name="yellow_mug_handle_lower_collision" type="capsule" fromto="0 0.033 -0.034 0 0.074 -0.028" size="0.006" group="3" mass="0.001" friction="1.2 0.01 0.001" margin="0.001"/>
     </body>
 
     <!-- 通用 mesh 回归对象：非对称刚体兔子。抓取标注只允许夹住长耳朵的
@@ -86,11 +86,11 @@
       <freejoint name="orange_rabbit_freejoint"/>
       <geom name="orange_rabbit_visual" type="mesh" mesh="rabbit_ears_visual_mesh" material="rabbit_orange" contype="0" conaffinity="0" group="2"/>
       <!-- CAD 由相同椭球与独立耳盒生成；耳间空隙保留，不允许跨空隙伪接触。 -->
-      <geom name="orange_rabbit_body_collision" type="ellipsoid" pos="0 0 -0.058" size="0.060 0.040 0.052" material="rabbit_orange" mass="0.23" friction="1.5 0.01 0.001" margin="0.001"/>
-      <geom name="orange_rabbit_head_collision" type="ellipsoid" pos="-0.030 0 0.010" size="0.024 0.031 0.037" material="rabbit_orange" mass="0.02" friction="1.2 0.01 0.001" margin="0.001"/>
-      <geom name="orange_rabbit_long_ear_collision" type="box" pos="-0.014 0 0.075" size="0.010 0.012 0.035" material="rabbit_orange" mass="0.006" friction="1.8 0.01 0.001" margin="0.001"/>
-      <geom name="orange_rabbit_short_ear_collision" type="box" pos="0.016 0 0.0565" size="0.010 0.012 0.0215" material="rabbit_orange" mass="0.004" friction="1.8 0.01 0.001" margin="0.001"/>
-      <geom name="orange_rabbit_tail_collision" type="sphere" pos="0.071 0 -0.055" size="0.020" material="rabbit_orange" mass="0.005" friction="1.2 0.01 0.001" margin="0.001"/>
+      <geom name="orange_rabbit_body_collision" type="ellipsoid" pos="0 0 -0.058" size="0.060 0.040 0.052" material="rabbit_orange" group="3" mass="0.23" friction="1.5 0.01 0.001" margin="0.001"/>
+      <geom name="orange_rabbit_head_collision" type="ellipsoid" pos="-0.030 0 0.010" size="0.024 0.031 0.037" material="rabbit_orange" group="3" mass="0.02" friction="1.2 0.01 0.001" margin="0.001"/>
+      <geom name="orange_rabbit_long_ear_collision" type="box" pos="-0.014 0 0.075" size="0.010 0.012 0.035" material="rabbit_orange" group="3" mass="0.006" friction="1.8 0.01 0.001" margin="0.001"/>
+      <geom name="orange_rabbit_short_ear_collision" type="box" pos="0.016 0 0.0565" size="0.010 0.012 0.0215" material="rabbit_orange" group="3" mass="0.004" friction="1.8 0.01 0.001" margin="0.001"/>
+      <geom name="orange_rabbit_tail_collision" type="sphere" pos="0.071 0 -0.055" size="0.020" material="rabbit_orange" group="3" mass="0.005" friction="1.2 0.01 0.001" margin="0.001"/>
     </body>
 
     <!-- 托盘底板半厚为 12 mm，中心 z=0.407，使底板直接置于桌面 z=0.395。 -->

@@ -15,6 +15,9 @@ from vision_moveit_demo.cad_matching import GenericMeshCadMatcher, ObjectCatalog
 
 
 def main() -> None:
+    # Both mesh sampling and registration use Open3D's generator; NumPy's seed
+    # alone does not make this missing-handle negative reproducible.
+    o3d.utility.random.seed(20261013)
     model = ObjectCatalog(ROOT).find(RuleVlmAdapter().infer("抓取黄色马克杯把手并放到托盘"))
     model = replace(model, geometry_type="mesh")
     matcher = GenericMeshCadMatcher()

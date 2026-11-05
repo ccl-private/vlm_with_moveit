@@ -51,7 +51,15 @@ def main() -> None:
     transform = np.eye(4)
     transform[:3, :3] = GenericMeshCadMatcher._rotation_z(np.deg2rad(45.0))
     transform[:3, 3] = (0.45, -0.12, 0.445)
-    expected = np.concatenate((positive, negative)) @ transform[:3, :3].T + transform[:3, 3]
+    # Normal estimation needs a local surface neighborhood, not just the narrow
+    # annotation strip. Include independently sampled CAD surface context as a
+    # real depth image does; the ROI itself is still the same contact template.
+    triangles=model.vertices_object_m[model.triangles_object]
+    areas=np.linalg.norm(np.cross(triangles[:,1]-triangles[:,0],triangles[:,2]-triangles[:,0]),axis=1)
+    selected=generator.choice(len(triangles),2500,p=areas/areas.sum())
+    u,v=generator.random((2,len(selected)));r=np.sqrt(u)
+    context=(triangles[selected]*np.column_stack((1-r,r*(1-v),r*v))[:,:,None]).sum(axis=1)
+    expected = np.concatenate((positive, negative, context)) @ transform[:3, :3].T + transform[:3, 3]
     # Two independent wrist baselines see both required contact surfaces; add
     # depth-scale noise and unrelated yellow points to exercise robust matching.
     clouds = []

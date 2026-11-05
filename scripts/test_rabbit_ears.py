@@ -32,7 +32,14 @@ def main() -> None:
         geometry_confidence=0.9, axial_yaw_observable=True, cylinder_axis_base=seed[:3, 2],
         point_count=1000, matching_method="generic_mesh_test", object_yaw_rad=0.,
     )
-    observed = np.concatenate(patches) + transform[:3, 3]
+    # Two cropped planar patches alone are yaw-ambiguous after edge/neighbor
+    # contamination is removed. Real wrist RGB-D also carries body/ear context.
+    triangles=model.vertices_object_m[model.triangles_object]
+    areas=np.linalg.norm(np.cross(triangles[:,1]-triangles[:,0],triangles[:,2]-triangles[:,0]),axis=1)
+    selected=generator.choice(len(triangles),2500,p=areas/areas.sum())
+    u,v=generator.random((2,len(selected)));r=np.sqrt(u)
+    context=(triangles[selected]*np.column_stack((1-r,r*(1-v),r*v))[:,:,None]).sum(axis=1)
+    observed = np.concatenate((*patches,context)) + transform[:3, 3]
     clouds = [observed + generator.normal(0., 0.0005, observed.shape) for _ in range(2)]
     result = matcher.refine_clouds(model, template, pose, clouds)
     assert np.linalg.norm(result.pose.position_base_m - transform[:3, 3]) < 0.003

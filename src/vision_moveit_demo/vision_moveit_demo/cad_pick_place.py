@@ -9,6 +9,7 @@ import argparse
 from dataclasses import replace
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -433,6 +434,7 @@ def main() -> None:
             "enabled": arguments.active_observation,
             "mode": arguments.active_observation_mode,
             "max_wrist_observations": arguments.max_wrist_observations,
+            "coarse_pose": coarse_pose.as_dict(),
             "views": [],
             "selected_source": "fixed",
         }
@@ -458,10 +460,12 @@ def main() -> None:
                 hand_from_camera = np.linalg.inv(_base_from_body(simulation, "hand")) @ wrist_frame.base_from_camera
                 contact_centers, contact_normals = _contact_geometry_base(pose, templates)
                 observation_views = generate_observation_views(
-                    pose.position_base_m,
+                    contact_centers.mean(axis=0),
                     contact_centers,
                     contact_normals,
                     hand_from_camera,
+                    radius_m=0.16,
+                    elevation_m=0.16,
                 )
                 successful_observations = 0
                 matched_observations: list[tuple[object, object, object, dict[str, object]]] = []
@@ -1101,14 +1105,21 @@ def main() -> None:
                             full_grasp_path="pregrasp_and_approach_validated",
                         )
                         active_observation["views"].append(entry)
+                        if observation_debug_dir is not None:
+                            (observation_debug_dir/f'on_path_{observation_index}.json').write_text(
+                                json.dumps(entry,ensure_ascii=False,indent=2)+'\n')
                         break
                     except (RuntimeError, TimeoutError) as error:
                         local_failure = str(error)
+                        entry['grasp_roi_rejection'] = grasp_roi_matcher.last_diagnostics
                         entry.update(
                             status="goal_unreachable" if isinstance(error, TimeoutError) else "requires_local_reobserve",
                             reason=local_failure,
                         )
                         active_observation["views"].append(entry)
+                        if observation_debug_dir is not None:
+                            (observation_debug_dir/f'on_path_{observation_index}.json').write_text(
+                                json.dumps(entry,ensure_ascii=False,indent=2)+'\n')
                         if observation_index + 1 >= maximum_wrist_observations:
                             raise RuntimeError(
                                 "on_path_reobserve_exhausted：近距腕部校正未获得可达且一致的抓取 pose："
@@ -1631,6 +1642,20 @@ def main() -> None:
             client.destroy_node()
             rclpy.shutdown()
     finally:
+        # Preserve actual events even when a failed trial never writes episode.json.
+        # This is diagnostic output, not an inferred or synthetic successful episode.
+        if arguments.episode_dir is not None and 'executor' in locals():
+            try:
+                trace=arguments.episode_dir
+                if not trace.is_absolute():trace=arguments.root/trace
+                trace.mkdir(parents=True,exist_ok=True)
+                failure=sys.exc_info()[1]
+                (trace/'runtime_trace.json').write_text(json.dumps(dict(
+                    outcome='failed' if failure is not None else 'returned',error=repr(failure) if failure else None,
+                    events=[dict(name=e.name,sim_s=e.timestamp,details=e.details) for e in executor.events],
+                    active_observation=locals().get('active_observation',{})),ensure_ascii=False,indent=2)+'\n')
+            except Exception as trace_error:
+                print('诊断事件保存失败：'+repr(trace_error),file=sys.stderr)
         if viewer is not None:
             viewer.close()
         simulation.close()

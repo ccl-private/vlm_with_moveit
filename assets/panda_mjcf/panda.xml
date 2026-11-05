@@ -217,11 +217,10 @@
                     <geom mesh="link7_c" class="collision"/>
                     <body name="hand" pos="0 0 0.107" quat="0.9238795 0 0 -0.3826834">
                       <inertial mass="0.73" pos="-0.01 0 0.03" diaginertia="0.001 0.0025 0.0017"/>
-                      <!-- 外上侧斜视眼在手（RGB-D）：镜头靠近夹爪而非退在手腕后方，
-                           从侧上方对准两指之间的接触区。这样不会沿着掌心/前臂方向
-                           穿透自身机构观察，抓取区在近距复检时也不会被手掌遮住。 -->
-                      <camera name="camera_wrist" pos="-0.10 -0.12 -0.08"
-                              xyaxes="0.768 -0.640 0 -0.458 -0.550 0.699" fovy="65"/>
+                      <!-- 掌前的外侧光学安装；补观察时视线不再从掌后穿过手掌。
+                           只改相机外参，刚体质量、关节和碰撞几何保持不变。 -->
+                      <camera name="camera_wrist" pos="-0.06 -0.06 0.12"
+                              xyaxes="0.707106781186548 -0.707106781186548 0 -0.162221421130763 -0.162221421130763 0.973328526784575" fovy="65"/>
                       <geom mesh="hand_0" material="off_white" class="visual"/>
                       <geom mesh="hand_1" material="black" class="visual"/>
                       <geom mesh="hand_2" material="black" class="visual"/>

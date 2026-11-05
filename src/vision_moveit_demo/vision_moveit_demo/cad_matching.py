@@ -13,6 +13,7 @@ import numpy as np
 import open3d as o3d
 
 from .unified_scene import UnifiedCameraFrame
+from .grasp_surface_geometry import SurfaceObservation, estimate_surface, nearest_surface, sample_contact_patch
 
 
 @dataclass(frozen=True)
@@ -221,8 +222,20 @@ class ColorThresholdSegmenter:
             # 颜色先验对相邻物体仍有价值，但高光会令杯身变白。因此 ROI 内的
             # 高亮低饱和前景也可保留；桌面已由 z 门限排除。
             bright_foreground = (red > 175) & (green > 145) & (blue < 120)
-            candidate = roi & (candidate | bright_foreground)
-            source = "color_threshold_with_coarse_pose_depth_roi"
+            # Inside the independently estimated depth ROI only, preserve shaded
+            # pixels of the same chromaticity as the original bright color seed.
+            # Absolute intensity otherwise removes an entire contact face under
+            # directional light. No object category or simulator labels are used.
+            seed = self._largest_component(roi & candidate)
+            shaded = np.zeros_like(candidate)
+            if np.count_nonzero(seed) >= 30:
+                channels = rgb.astype(np.float64)
+                brightness = channels.sum(axis=2)
+                chroma = channels/np.maximum(brightness[..., None], 1.)
+                reference = np.median(chroma[seed], axis=0)
+                shaded = (brightness >= 60.) & (np.linalg.norm(chroma-reference,axis=2) <= .07)
+            candidate = roi & (candidate | bright_foreground | shaded)
+            source = "color_threshold_with_coarse_pose_depth_roi_and_seed_chromaticity"
         component = self._largest_component(candidate)
         rows, columns = np.nonzero(component)
         pixel_count = int(len(rows))
@@ -1652,6 +1665,11 @@ class GraspRoiMatcher:
     _MAX_LOCAL_TRANSLATION_M = 0.025
     _MAX_LOCAL_ROTATION_DEG = 10.0
     _YAW_HYPOTHESES = 24
+    _NORMAL_COSINE = float(np.cos(np.deg2rad(25.0)))
+    _CAD_NORMAL_COSINE = float(np.cos(np.deg2rad(20.0)))
+
+    def __init__(self):
+        self.last_diagnostics = {}
 
     @staticmethod
     def _rotation_angle_deg(rotation: np.ndarray) -> float:
@@ -1681,33 +1699,8 @@ class GraspRoiMatcher:
 
     @staticmethod
     def _roi_vertices(model: CadModel, surface: ContactSurface) -> np.ndarray:
-        """Extract a CAD patch around one annotated contact surface.
-
-        The annotation gives a point and normal, not mesh face indices.  A
-        thin normal slab plus a height-scaled tangent envelope works for any
-        CAD carrying the existing generic contact-pair schema.
-        """
-        vertices = model.vertices_object_m
-        if surface.patch_radius_m is not None:
-            triangles = vertices[model.triangles_object]
-            areas = np.linalg.norm(np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1)
-            generator = np.random.default_rng(20261013)
-            indices = generator.choice(len(triangles), 12000, p=areas / areas.sum())
-            u, v = generator.random((2, len(indices)))
-            root = np.sqrt(u)
-            weights = np.column_stack((1.0 - root, root * (1.0 - v), root * v))
-            vertices = np.concatenate((vertices, (triangles[indices] * weights[:, :, None]).sum(axis=1)))
-        delta = vertices - surface.center_object_m
-        normal_distance = np.abs(delta @ surface.normal_object)
-        tangent_distance = np.linalg.norm(
-            delta - np.outer(delta @ surface.normal_object, surface.normal_object), axis=1
-        )
-        slab_m = float(np.clip(model.height_m * 0.055, 0.0035, 0.0065))
-        radius_m = surface.patch_radius_m or float(np.clip(model.height_m * 0.38, 0.024, 0.045))
-        selected = vertices[(normal_distance <= slab_m) & (tangent_distance <= radius_m)]
-        if len(selected) < 16:
-            raise RuntimeError(f"抓取 ROI CAD 面采样不足：{surface.region_id} 仅有 {len(selected)} 个顶点")
-        return selected[:: max(1, len(selected) // 120)]
+        """Return only annotation-aligned triangle interiors, never mesh corners."""
+        return sample_contact_patch(model, surface, cosine=GraspRoiMatcher._CAD_NORMAL_COSINE)[0]
 
     @staticmethod
     def _trimmed_mean(values: np.ndarray, fraction: float = 0.50) -> float:
@@ -1717,37 +1710,66 @@ class GraspRoiMatcher:
         return float(np.partition(values, count - 1)[:count].mean())
 
     def _surface_evidence(
-        self, transformed_surface: np.ndarray, clouds: list[np.ndarray]
+        self, transformed_surface: np.ndarray, normals: np.ndarray, observations
     ) -> tuple[float, float, list[float]]:
         supports: list[float] = []
         residuals: list[float] = []
-        for cloud in clouds:
-            distances, _, _ = self._nearest(transformed_surface, cloud)
+        for observation in observations:
+            distances, _, _ = nearest_surface(transformed_surface, normals, observation,
+                max_distance=self._SUPPORT_DISTANCE_M, cosine=self._NORMAL_COSINE)
             supports.append(float(np.mean(distances <= self._SUPPORT_DISTANCE_M)))
             residuals.append(self._trimmed_mean(distances))
         return max(supports, default=0.0), min(residuals, default=float("inf")), supports
 
+    def _surface_diagnostics(self, surface, normals, observations):
+        records = []
+        for view in observations:
+            distances, _, indices = self._nearest(surface,view.points)
+            close = distances <= self._SUPPORT_DISTANCE_M
+            alignment = np.einsum('ni,ni->n',normals,view.normals[indices])
+            if view.camera is None:
+                alignment = abs(alignment)
+            reliable = view.valid[indices]
+            angles = np.degrees(np.arccos(np.clip(alignment[close & reliable],-1.,1.)))
+            _, _, joint = nearest_surface(surface,normals,view,
+                max_distance=self._SUPPORT_DISTANCE_M,cosine=self._NORMAL_COSINE)
+            records.append(dict(cad_samples=len(surface),distance_only_support=float(close.mean()),
+                joint_support=float(joint.mean()),unknown_nearest_normals=int((close & ~reliable).sum()),
+                incompatible_nearest_normals=int((close & reliable & (alignment<self._NORMAL_COSINE)).sum()),
+                nearest_normal_angle_deg_quantiles=np.quantile(angles,[0,.5,.9,1]).tolist() if len(angles) else []))
+        return records
+
     def _refine_candidate(
-        self, initial: np.ndarray, object_roi: np.ndarray, observed: np.ndarray
+        self, initial: np.ndarray, object_roi: np.ndarray, object_normals: np.ndarray, observations
     ) -> np.ndarray | None:
         transform = initial.copy()
-        for _ in range(6):
+        for iteration in range(6):
             world_roi = object_roi @ transform[:3, :3].T + transform[:3, 3]
-            distances, nearest, _ = self._nearest(world_roi, observed)
+            world_normals = object_normals @ transform[:3, :3].T
+            matches = [nearest_surface(world_roi, world_normals, view,
+                max_distance=self._CORRESPONDENCE_DISTANCE_M, cosine=self._NORMAL_COSINE)
+                for view in observations]
+            all_distances = np.stack([m[0] for m in matches])
+            best = all_distances.argmin(axis=0)
+            distances = all_distances[best, np.arange(len(world_roi))]
+            nearest = np.stack([m[1] for m in matches])[best, np.arange(len(world_roi))]
             keep = distances <= self._CORRESPONDENCE_DISTANCE_M
             if int(np.count_nonzero(keep)) < 18:
                 return None
             correction = self._kabsch(world_roi[keep], nearest[keep])
-            transform = correction @ transform
+            proposal = correction @ transform
             # ``transform @ inv(initial)`` 的平移分量会包含“绕 CAD 原点
             # 旋转”带来的基座原点项；这里的局部收敛约束应比较物体中心位置，
             # 而非该复合矩阵的平移列。
-            relative_rotation = transform[:3, :3] @ initial[:3, :3].T
+            relative_rotation = proposal[:3, :3] @ initial[:3, :3].T
             if (
-                float(np.linalg.norm(transform[:3, 3] - initial[:3, 3])) > self._MAX_LOCAL_TRANSLATION_M
+                float(np.linalg.norm(proposal[:3, 3] - initial[:3, 3])) > self._MAX_LOCAL_TRANSLATION_M
                 or self._rotation_angle_deg(relative_rotation) > self._MAX_LOCAL_ROTATION_DEG
             ):
-                return None
+                # Reject the new step, not an already feasible preceding iterate.
+                # All normal/support gates still apply to that retained iterate.
+                return transform if iteration else None
+            transform = proposal
             if (
                 float(np.linalg.norm(correction[:3, 3])) < 2e-4
                 and self._rotation_angle_deg(correction[:3, :3]) < 0.15
@@ -1762,11 +1784,65 @@ class GraspRoiMatcher:
         global_pose: CadPoseEstimate,
         observations: list[tuple[SegmentationResult, UnifiedCameraFrame]],
     ) -> GraspRoiEstimate:
-        clouds = [
-            _points_from_mask(frame, segmentation.mask)[:: max(1, segmentation.pixel_count // 850)]
-            for segmentation, frame in observations
-        ]
-        return self.refine_clouds(model, template, global_pose, clouds)
+        clouds, prepared = [], []
+        for segmentation,frame in observations:
+            dense = _points_from_mask(frame,segmentation.mask)
+            view = estimate_surface(dense,frame.base_from_camera[:3,3])
+            step = max(1,segmentation.pixel_count//850)
+            clouds.append(dense[::step])
+            prepared.append(SurfaceObservation(view.points[::step],view.normals[::step],
+                view.valid[::step],view.camera))
+        return self.refine_clouds(model, template, global_pose, clouds,
+            camera_positions=[frame.base_from_camera[:3, 3] for _,frame in observations],
+            surface_observations=prepared)
+
+    def _refine_context_candidate(self, transform, initial, observations, scene):
+        """Resolve tangential sliding with observed CAD context, within the same bounds.
+
+        Opposing parallel contact planes alone cannot locate a grasp along those
+        planes. Point-to-plane ICP uses the surrounding measured surface; it does
+        not add support to either contact patch. Every correspondence still needs
+        a reliable, compatible normal and the original 18 mm distance limit.
+        """
+        points = np.concatenate([v.points[v.valid] for v in observations])
+        normals = np.concatenate([v.normals[v.valid] for v in observations])
+        oriented = np.concatenate([np.full(int(v.valid.sum()),v.camera is not None) for v in observations])
+        transform = transform.copy()
+        if len(points) < 40:
+            return transform
+        for _ in range(6):
+            local = (points-transform[:3,3]) @ transform[:3,:3]
+            closest = scene.compute_closest_points(o3d.core.Tensor(local.astype(np.float32)))
+            source = closest['points'].numpy() @ transform[:3,:3].T + transform[:3,3]
+            face_normals = closest['primitive_normals'].numpy() @ transform[:3,:3].T
+            alignment = np.einsum('ni,ni->n',face_normals,normals)
+            alignment = np.where(oriented,alignment,abs(alignment))
+            keep = ((np.linalg.norm(points-source,axis=1)<=self._CORRESPONDENCE_DISTANCE_M)
+                    & (alignment>=self._NORMAL_COSINE))
+            if int(keep.sum()) < 40:
+                break
+            source, normal = source[keep], face_normals[keep]
+            residual = np.einsum('ni,ni->n',points[keep]-source,normal)
+            design = np.column_stack((np.cross(source-transform[:3,3],normal),normal))
+            delta, _, rank, _ = np.linalg.lstsq(design,residual,rcond=1e-6)
+            if rank < 6:
+                break
+            vector = delta[:3]
+            angle = float(np.linalg.norm(vector))
+            x,y,z = vector
+            skew = np.array([[0.,-z,y],[z,0.,-x],[-y,x,0.]])
+            rotation = (np.eye(3)+np.sinc(angle/np.pi)*skew
+                        + .5*np.sinc(angle/(2*np.pi))**2*(skew@skew))
+            proposal = transform.copy()
+            proposal[:3,:3] = rotation @ transform[:3,:3]
+            proposal[:3,3] += delta[3:]
+            if (np.linalg.norm(proposal[:3,3]-initial[:3,3])>self._MAX_LOCAL_TRANSLATION_M
+                    or self._rotation_angle_deg(proposal[:3,:3]@initial[:3,:3].T)>self._MAX_LOCAL_ROTATION_DEG):
+                break
+            transform = proposal
+            if np.linalg.norm(delta[3:])<2e-4 and np.degrees(angle)<.15:
+                break
+        return transform
 
     def refine_clouds(
         self,
@@ -1774,16 +1850,37 @@ class GraspRoiMatcher:
         template: GraspTemplate,
         global_pose: CadPoseEstimate,
         clouds: list[np.ndarray],
+        *, camera_positions: list[np.ndarray] | None = None,
+        surface_observations: list[SurfaceObservation] | None = None,
     ) -> GraspRoiEstimate:
         """Cloud-level entry point used by deterministic regression tests."""
+        self.last_diagnostics = {}
         if len(clouds) < 2:
             raise RuntimeError("抓取 ROI 精配准至少需要两条腕部 RGB-D 基线")
         clouds = [np.asarray(cloud, dtype=np.float64) for cloud in clouds]
         if any(len(cloud) < 40 for cloud in clouds):
             raise RuntimeError("抓取 ROI 精配准的单帧有效点不足")
-        positive_object = self._roi_vertices(model, template.opposing_contact_pair.positive_surface)
-        negative_object = self._roi_vertices(model, template.opposing_contact_pair.negative_surface)
+        if camera_positions is not None and len(camera_positions) != len(clouds):
+            raise ValueError('one camera origin per original view required')
+        if surface_observations is None:
+            observations = [estimate_surface(cloud, None if camera_positions is None else camera_positions[i])
+                            for i,cloud in enumerate(clouds)]
+        else:
+            if len(surface_observations)!=len(clouds) or any(
+                not np.array_equal(v.points,c) or v.normals.shape!=c.shape
+                or v.valid.shape!=(len(c),) or v.valid.dtype!=bool
+                or not np.isfinite(v.normals).all()
+                or (camera_positions is not None and
+                    (v.camera is None or not np.array_equal(v.camera,camera_positions[i])))
+                for i,(v,c) in enumerate(zip(surface_observations,clouds))):
+                raise ValueError('prepared normals must belong to original view points')
+            observations=surface_observations
+        positive_object, positive_normals = sample_contact_patch(model,
+            template.opposing_contact_pair.positive_surface, cosine=self._CAD_NORMAL_COSINE)
+        negative_object, negative_normals = sample_contact_patch(model,
+            template.opposing_contact_pair.negative_surface, cosine=self._CAD_NORMAL_COSINE)
         object_roi = np.concatenate((positive_object, negative_object), axis=0)
+        object_normals = np.concatenate((positive_normals, negative_normals))
         observed = np.concatenate(clouds, axis=0)
         if len(observed) < 80:
             raise RuntimeError("抓取 ROI 精配准的腕部有效点不足")
@@ -1802,16 +1899,19 @@ class GraspRoiMatcher:
             local_yaw = np.eye(4)
             local_yaw[:3, :3] = GenericMeshCadMatcher._rotation_z(float(yaw_offset))
             initial = global_pose.transform_base_object @ local_yaw
-            refined = self._refine_candidate(initial, object_roi, observed)
+            refined = self._refine_candidate(initial, object_roi, object_normals, observations)
             # 抓取区在单一腕部图像里经常只露出把手的一条外弧。此时最近邻
             # Kabsch 可能被部分曲面拉向错误的小旋转；原始 CAD yaw 假设本身
             # 仍须作为可解释候选进入双表面证据门禁，而不是被优化器静默丢弃。
             if refined is None:
                 refined = initial
+            refined = self._refine_context_candidate(refined,initial,observations,context_scene)
             positive = positive_object @ refined[:3, :3].T + refined[:3, 3]
             negative = negative_object @ refined[:3, :3].T + refined[:3, 3]
-            positive_support, positive_residual, positive_per_view = self._surface_evidence(positive, clouds)
-            negative_support, negative_residual, negative_per_view = self._surface_evidence(negative, clouds)
+            positive_support, positive_residual, positive_per_view = self._surface_evidence(
+                positive, positive_normals @ refined[:3,:3].T, observations)
+            negative_support, negative_residual, negative_per_view = self._surface_evidence(
+                negative, negative_normals @ refined[:3,:3].T, observations)
             supporting_views = sum(
                 max(pos, neg) >= self._MIN_SURFACE_SUPPORT
                 for pos, neg in zip(positive_per_view, negative_per_view)
@@ -1824,12 +1924,21 @@ class GraspRoiMatcher:
             context_distances = context_scene.compute_distance(o3d.core.Tensor(object_points.astype(np.float32))).numpy()
             context_support = float(np.mean(context_distances <= 0.006))
             score += 1.2 * context_support
+            if not np.isfinite(score):
+                continue
             candidates.append((
                 score, refined, positive_support, negative_support, positive_residual,
                 negative_residual, supporting_views, float(yaw_offset),
             ))
         if not candidates:
             raise RuntimeError("抓取 ROI 精配准没有获得足够的 CAD--深度对应")
+        eligible = [c for c in candidates if c[2]>=self._MIN_SURFACE_SUPPORT
+                    and c[3]>=self._MIN_SURFACE_SUPPORT and c[6]>=2
+                    and c[4]<=self._MAX_SURFACE_RESIDUAL_M and c[5]<=self._MAX_SURFACE_RESIDUAL_M]
+        # An ineligible high-context single-face hypothesis must not displace a
+        # fully validated pair. If none qualify, retain the best rejection reason.
+        if eligible:
+            candidates=eligible
         candidates.sort(key=lambda item: item[0], reverse=True)
         (score, transform, positive_support, negative_support, positive_residual,
          negative_residual, supporting_views, selected_yaw_offset) = candidates[0]
@@ -1845,6 +1954,11 @@ class GraspRoiMatcher:
         rotation_correction = self._rotation_angle_deg(
             transform[:3, :3] @ global_pose.transform_base_object[:3, :3].T
         )
+        self.last_diagnostics = dict(
+            positive=self._surface_diagnostics(positive_object@transform[:3,:3].T+transform[:3,3],
+                positive_normals@transform[:3,:3].T,observations),
+            negative=self._surface_diagnostics(negative_object@transform[:3,:3].T+transform[:3,3],
+                negative_normals@transform[:3,:3].T,observations))
         if (
             positive_support < self._MIN_SURFACE_SUPPORT
             or negative_support < self._MIN_SURFACE_SUPPORT
@@ -1864,7 +1978,23 @@ class GraspRoiMatcher:
             * (1.0 - max(positive_residual, negative_residual) / 0.012), 0.0, 1.0
         ))
         diagnostics = dict(global_pose.registration_diagnostics or {})
+        if diagnostics.get('coarse_seed_only'):
+            diagnostics['coarse_seed_only'] = False
+            diagnostics['coarse_seed_used_as_input'] = True
         diagnostics["grasp_roi"] = {
+            "per_view_surface_diagnostics": self.last_diagnostics,
+            "normal_validation": {
+                "maximum_angle_deg": 25.0, "cad_maximum_angle_deg": 20.0,
+                "cad_edge_margin_m": .0015, "neighborhood_radius_m": .008,
+                "neighborhood_max_points": 12, "neighborhood_min_points": 8,
+                "maximum_surface_variation": .08, "maximum_normal_tangent_ratio": .3,
+                "cad_samples": [len(positive_object), len(negative_object)],
+                "view_points": [len(view.points) for view in observations],
+                "view_reliable_normals": [int(view.valid.sum()) for view in observations],
+                "view_oriented": camera_positions is not None,
+                "eligible_candidates": len(eligible),
+                "context_refinement": "normal_compatible_point_to_plane_with_original_local_bounds",
+            },
             "template_id": template.template_id,
             "positive_surface_region": template.opposing_contact_pair.positive_surface.region_id,
             "negative_surface_region": template.opposing_contact_pair.negative_surface.region_id,
@@ -1890,10 +2020,10 @@ class GraspRoiMatcher:
             candidate_positive = positive_object @ candidate_transform[:3, :3].T + candidate_transform[:3, 3]
             candidate_negative = negative_object @ candidate_transform[:3, :3].T + candidate_transform[:3, 3]
             candidate_positive_support, candidate_positive_residual, candidate_positive_views = self._surface_evidence(
-                candidate_positive, clouds
+                candidate_positive, positive_normals @ candidate_transform[:3,:3].T, observations
             )
             candidate_negative_support, candidate_negative_residual, candidate_negative_views = self._surface_evidence(
-                candidate_negative, clouds
+                candidate_negative, negative_normals @ candidate_transform[:3,:3].T, observations
             )
             candidate_view_count = sum(
                 max(pos, neg) >= self._MIN_SURFACE_SUPPORT
