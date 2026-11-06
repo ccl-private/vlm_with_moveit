@@ -33,6 +33,9 @@ def sources():
     paths+=list((ROOT/'assets/object_models').glob('*'))
     paths+=list((ROOT/'assets/panda_mjcf').glob('*.xml'))
     paths+=[Path(__file__).resolve(),ROOT/"scripts/run_grasp_scenario.py"]
+    paths+=list((ROOT/'src/vision_moveit_bridge/src').glob('*.cpp'))
+    paths += [ROOT/'src/vision_moveit_bridge/package.xml', ROOT/'src/vision_moveit_bridge/CMakeLists.txt']
+    paths+=[ROOT/'install/vision_moveit_bridge/lib/vision_moveit_bridge/moveit_target_bridge']
     return {str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in paths if p.is_file()}
 
 
@@ -131,7 +134,7 @@ def main():
         report['completed']=True
     finally:
         stop_owned(task);stop_owned(planner);stop_owned(display)
-        node.destroy_node();rclpy.shutdown()
+        node.destroy_node();rclpy.try_shutdown()
         report['source_unchanged']=sources()==report['source_sha256']
         report['all_passed']=report['completed'] and report['source_unchanged'] and all(r['passed'] for r in report['records'])
         save()

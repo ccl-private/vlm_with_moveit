@@ -118,16 +118,12 @@ def _pose_with_local_z_yaw(pose, yaw_offset_rad: float):
 def _attached_pose_in_hand(
     object_position_base: np.ndarray,
     object_rotation_base: np.ndarray,
-    hand_position_base: np.ndarray,
-    hand_orientation_xyzw: np.ndarray,
+    base_from_hand: np.ndarray,
 ) -> Pose:
-    # 请求朝向属于 panda_link8；附着碰撞体却表达在 panda_hand。
-    # 两者存在固定 -45° 手爪安装转角，必须与真实 MuJoCo 抓取关系一致。
-    angle = -np.pi / 4.0
-    hand_mount_rotation = np.array([[np.cos(angle), -np.sin(angle), 0.], [np.sin(angle), np.cos(angle), 0.], [0., 0., 1.]])
-    hand_rotation = _quaternion_to_matrix(hand_orientation_xyzw) @ hand_mount_rotation
+    # 工件仍使用视觉估计；手位姿使用当前机器人 FK，不使用指令终点代替。
+    hand_rotation = base_from_hand[:3, :3]
     relative_rotation = hand_rotation.T @ object_rotation_base
-    relative_position = hand_rotation.T @ (object_position_base - hand_position_base)
+    relative_position = hand_rotation.T @ (object_position_base - base_from_hand[:3, 3])
     pose = Pose()
     pose.position.x, pose.position.y, pose.position.z = map(float, relative_position)
     pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = map(
@@ -757,7 +753,6 @@ def main() -> None:
                     flush=True,
                 )
             motion_wall_start = time.monotonic()
-            executor.set_gripper(opened=True)
             candidates = grasp_pose_candidates(pose, templates)
             if model.geometry_type == "mesh" and arguments.active_observation and arguments.active_observation_mode == "on_path":
                 # 粗配准尚未判定把手 yaw，不能据此把腕相机送往“猜测的把手”。
@@ -784,10 +779,7 @@ def main() -> None:
                     (candidate_template, pose.position_base_m + np.array([0.0, 0.0, candidate_position[2] - pose.position_base_m[2]]), candidate_orientation, pose)
                     for candidate_template, candidate_position, candidate_orientation, _candidate_pose in candidate_records
                 ]
-            # 横向把手抓取框（手腕绕工具 Z 旋转 90°）下，MoveIt ``panda_hand``
-            # 参考点相对 MuJoCo 指尖工作点低约 82 mm，故目标参考点须向上补偿。
-            # 该外参来自闭爪前记录的真实 pad 位姿，避免把手上方/下方的伪接触。
-            # CAD 标注与接触判定始终使用真实指尖工作点坐标系。
+            # 标注中心对应主接触垫中点。到 link8 的平移统一从机器人模型标定。
             for candidate_template, candidate_position, candidate_orientation, _candidate_pose in candidate_records:
                 print(
                     "[CAD 抓取候选] "
@@ -816,6 +808,7 @@ def main() -> None:
                 np.array([0.004, 0.004, 0.0]),
             )
             for candidate_template, candidate_position, candidate_orientation, candidate_pose in candidate_records:
+                executor.set_gripper_width(candidate_template.required_gripper_width_m)
                 for reachability_offset in reachability_offsets_base:
                     adjusted_position = candidate_position + reachability_offset
                     pregrasp = adjusted_position + np.array([0.0, 0.0, candidate_template.approach_clearance_m])
@@ -824,7 +817,7 @@ def main() -> None:
                     # 碰撞体时拒绝最终抓取中心的整段预抓取路径。
                     safe_pregrasp = pregrasp + np.array([0.005, 0.0, 0.0])
                     tcp_offset = _rotate_vector_by_quaternion(
-                        np.array([0.0, 0.0, -0.082]), candidate_orientation
+                        -executor.gripper_geometry.tcp_link8_m, candidate_orientation
                     )
                     moveit_pregrasp = safe_pregrasp + tcp_offset
                     offset_text = (
@@ -886,7 +879,7 @@ def main() -> None:
                 )
             ]
             tcp_offset = _rotate_vector_by_quaternion(
-                np.array([0.0, 0.0, -0.082]), grasp_orientation
+                -executor.gripper_geometry.tcp_link8_m, grasp_orientation
             )
             moveit_grasp_position = grasp_position + tcp_offset
             placement = catalog.physical_placement_targets(
@@ -1079,7 +1072,7 @@ def main() -> None:
                         _, candidate_grasp_position, candidate_orientation = refined_candidates[0]
                         candidate_grasp_position = candidate_grasp_position + reachability_offset
                         candidate_tcp_offset = _rotate_vector_by_quaternion(
-                            np.array([0.0, 0.0, -0.082]), candidate_orientation
+                            -executor.gripper_geometry.tcp_link8_m, candidate_orientation
                         )
                         candidate_moveit_grasp = candidate_grasp_position + candidate_tcp_offset
                         candidate_moveit_pregrasp = (
@@ -1153,7 +1146,7 @@ def main() -> None:
                     raise RuntimeError("on_path_reobserve_exhausted：精匹配后未生成原 CAD 抓取框")
                 template, refined_grasp_position, grasp_orientation = refined_candidates[0]
                 grasp_position = refined_grasp_position + reachability_offset
-                tcp_offset = _rotate_vector_by_quaternion(np.array([0.0, 0.0, -0.082]), grasp_orientation)
+                tcp_offset = _rotate_vector_by_quaternion(-executor.gripper_geometry.tcp_link8_m, grasp_orientation)
                 moveit_pregrasp = (
                     grasp_position
                     + np.array([0.005, 0.0, template.approach_clearance_m])
@@ -1227,7 +1220,7 @@ def main() -> None:
                         candidate_template, refined_grasp_position, candidate_orientation = refined_candidates[0]
                         candidate_grasp_position = refined_grasp_position + reachability_offset
                         candidate_tcp_offset = _rotate_vector_by_quaternion(
-                            np.array([0.0, 0.0, -0.082]), candidate_orientation
+                            -executor.gripper_geometry.tcp_link8_m, candidate_orientation
                         )
                         candidate_moveit_grasp = candidate_grasp_position + candidate_tcp_offset
                         candidate_moveit_pregrasp = (
@@ -1321,7 +1314,7 @@ def main() -> None:
                 attempt_pregrasp = attempt_grasp_position + np.array([0.0, 0.0, template.approach_clearance_m])
                 attempt_moveit_pregrasp = attempt_pregrasp + np.array([0.005, 0.0, 0.0]) + tcp_offset
                 if attempt > 1:
-                    executor.set_gripper(opened=True)
+                    executor.set_gripper_width(template.required_gripper_width_m)
                     executor.set_display_state(f"CAD grasp retry {attempt}: pregrasp")
                     client.publish_joint_state(executor.joint_positions())
                     time.sleep(0.25)
@@ -1376,7 +1369,7 @@ def main() -> None:
                                 fallback_pose,
                             ) in approach_fallbacks:
                                 fallback_tcp_offset = _rotate_vector_by_quaternion(
-                                    np.array([0.0, 0.0, -0.082]), fallback_orientation
+                                    -executor.gripper_geometry.tcp_link8_m, fallback_orientation
                                 )
                                 fallback_moveit_position = fallback_grasp_position + fallback_tcp_offset
                                 client.publish_joint_state(executor.joint_positions())
@@ -1486,7 +1479,9 @@ def main() -> None:
                         # 闭合失败后夹爪可能正与目标接触。先沿刚刚验证过的轨迹
                         # 反向退出到安全预抓取构型，再为下一局部偏移重新规划；否则
                         # MoveIt 会把接触中的当前构型判为无效起点并让所有重试超时。
-                        executor.set_gripper(opened=True)
+                        # 当前可能仍与目标接触；先松开并退出，到安全位后再严格
+                        # 验收预张开。这里的实际手指状态仍会用于后续规划。
+                        executor.set_gripper_width(template.required_gripper_width_m, require_reached=False)
                         executor.set_display_state(f"CAD grasp retry {attempt}: safe retreat")
                         _retreat_observation_trajectory(
                             executor, approach_trajectory, approach_start_joint_positions
@@ -1501,13 +1496,24 @@ def main() -> None:
             attached_pose = _attached_pose_in_hand(
                 pose.position_base_m,
                 pose.transform_base_object[:3, :3],
-                moveit_grasp_position,
-                grasp_orientation,
+                _base_from_body(simulation, "hand"),
             )
-            object_grasp_offset = pose.transform_base_object[:3, :3].T @ (grasp_position - pose.position_base_m)
+            attached_position = np.array([attached_pose.position.x, attached_pose.position.y, attached_pose.position.z])
+            attached_rotation = _quaternion_to_matrix(np.array([
+                attached_pose.orientation.x, attached_pose.orientation.y,
+                attached_pose.orientation.z, attached_pose.orientation.w]))
+            hand_mount = _base_from_body(simulation, "link7")[:3, :3].T @ _base_from_body(simulation, "hand")[:3, :3]
+            # 物体原先由桌面支承。附着模型保留后，亚毫米视觉误差会让这项
+            # 正常支承接触阻止起点规划；先严格核对碰撞对和深度，再仅为离桌段
+            # 许可工件／桌面一对，并对整条轨迹独立验收净空，随后立即恢复。
+            client.publish_task_scene(catalog.fixture_collision_positions(), target_object_id,
+                                      PlanningPhase.TRANSPORT, attached_pose=attached_pose)
+            client.publish_joint_state(executor.joint_positions())
+            time.sleep(.25)
+            client.check_attached_start(target_object_id)
             for stage, target in targets[1:]:
                 executor.set_display_state(f"CAD grasp / MoveIt: {stage} with {target_object_id}")
-                phase = PlanningPhase.PLACE if stage.startswith("place") else PlanningPhase.TRANSPORT
+                phase = PlanningPhase.PLACE if stage.startswith("place") else PlanningPhase.LIFT
                 client.publish_task_scene(
                     catalog.fixture_collision_positions(),
                     target_object_id,
@@ -1520,31 +1526,54 @@ def main() -> None:
                 last_transport_error = None
                 # 物体已夹持后可整体小幅转向；物体与夹爪的相对抓取关系保持
                 # 固定。所有 CAD 使用同一组有限候选，逐项做完整碰撞规划。
-                for yaw_delta_deg in (0., -5., 5., -10., 10.):
+                lift_heights = ([template.lift_clearance_m] + [template.lift_clearance_m - delta
+                                for delta in (.02, .04, .06)
+                                if template.lift_clearance_m - delta >= .06]) if stage == "lift" else [None]
+                transport_candidates = [(height, yaw) for height in lift_heights
+                                        for yaw in (0., -5., 5., -10., 10.)]
+                for lift_height, yaw_delta_deg in transport_candidates:
                     candidate_pose = _pose_with_local_z_yaw(pose, np.deg2rad(yaw_delta_deg))
-                    _, _, candidate_orientation = grasp_pose_candidates(candidate_pose, (template,))[0]
-                    candidate_tcp = _rotate_vector_by_quaternion(np.array([0., 0., -0.082]), candidate_orientation)
+                    desired_hand_rotation = candidate_pose.transform_base_object[:3, :3] @ attached_rotation.T
+                    candidate_orientation = _matrix_to_quaternion(desired_hand_rotation @ hand_mount.T)
                     candidate_placement = catalog.physical_placement_targets(model, template, candidate_pose.transform_base_object[:3, :3])
                     if stage == "lift":
-                        object_center = pose.position_base_m + np.array([0., 0., template.lift_clearance_m])
+                        object_center = pose.position_base_m + np.array([0., 0., lift_height])
                     elif stage == "place_above":
                         object_center = candidate_placement.object_release_center_base_m + np.array([0., 0., candidate_placement.gripper_above_base_m[2] - candidate_placement.gripper_release_base_m[2]])
                     else:
                         object_center = candidate_placement.object_release_center_base_m
-                    candidate_target = object_center + candidate_pose.transform_base_object[:3, :3] @ object_grasp_offset + candidate_tcp
+                    candidate_target = object_center - desired_hand_rotation @ attached_position
                     try:
                         transport_trajectory = client.request(candidate_target, candidate_orientation)
+                        if stage == "lift":
+                            attached_shape = client.attached_collision_object.object.primitives[0]
+                            executor.validate_support_lift(
+                                transport_trajectory.joint_trajectory.joint_names,
+                                [p.positions for p in transport_trajectory.joint_trajectory.points],
+                                attached_position, attached_rotation,
+                                "box" if attached_shape.type == attached_shape.BOX else "cylinder",
+                                attached_shape.dimensions,
+                                float(catalog.fixture_collision_positions()["table"][2] + .035))
                     except TimeoutError as error:
+                        last_transport_error = error
+                        continue
+                    except RuntimeError as error:
+                        transport_trajectory = None
                         last_transport_error = error
                         continue
                     pose = candidate_pose
                     grasp_orientation = candidate_orientation
                     placement = candidate_placement
                     executor._event("transport_orientation_selected", stage=stage, local_yaw_offset_deg=yaw_delta_deg)
+                    if stage == "lift":
+                        executor._event("lift_height_selected", height_m=float(lift_height))
                     break
                 if transport_trajectory is None:
                     raise RuntimeError(f"通用搬运阶段 {stage} 的全部姿态候选不可达：{last_transport_error}")
                 _execute_trajectory(executor, transport_trajectory)
+                if stage == "lift":
+                    client.publish_task_scene(catalog.fixture_collision_positions(), target_object_id,
+                                              PlanningPhase.TRANSPORT, attached_pose=attached_pose)
                 executor._event(
                     f"moveit_{stage}_complete",
                     hand_x=float(executor.body_position("hand")[0]),
@@ -1585,6 +1614,7 @@ def main() -> None:
                 },
                 "pose_estimate": pose.as_dict(),
                 "grasp_position_base_m": grasp_position.tolist(),
+                "gripper_geometry": executor.gripper_geometry.as_dict(),
                 "grasp_orientation_base_xyzw": grasp_orientation.tolist(),
                 "grasp_annotation": {
                     "frame_id": template.template_id,
@@ -1604,6 +1634,7 @@ def main() -> None:
                         },
                     },
                     "quality": template.quality,
+                    "required_gripper_width_m": template.required_gripper_width_m,
                 },
                 "grasp_candidate_selection": {
                     "candidate_count": len(candidates),
@@ -1639,8 +1670,11 @@ def main() -> None:
                 viewer.render_once(f"Success: CAD matched {target_object_id} in tray")
                 print("CAD 模型匹配回合成功；正在自动关闭 VNC 并保存 MP4。", flush=True)
         finally:
-            client.destroy_node()
-            rclpy.shutdown()
+            try:
+                client.restore_support_contact()
+            finally:
+                client.destroy_node()
+                rclpy.shutdown()
     finally:
         # Preserve actual events even when a failed trial never writes episode.json.
         # This is diagnostic output, not an inferred or synthetic successful episode.
@@ -1654,6 +1688,8 @@ def main() -> None:
                     outcome='failed' if failure is not None else 'returned',error=repr(failure) if failure else None,
                     events=[dict(name=e.name,sim_s=e.timestamp,details=e.details) for e in executor.events],
                     active_observation=locals().get('active_observation',{})),ensure_ascii=False,indent=2)+'\n')
+                if 'client' in locals():
+                    (trace/'planning_trace.json').write_text(json.dumps(client.planning_trace, ensure_ascii=False, indent=2)+'\n')
             except Exception as trace_error:
                 print('诊断事件保存失败：'+repr(trace_error),file=sys.stderr)
         if viewer is not None:

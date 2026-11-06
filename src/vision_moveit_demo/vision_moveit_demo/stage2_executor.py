@@ -12,6 +12,7 @@ import mujoco
 import numpy as np
 
 from .unified_scene import UnifiedPandaCupSimulation
+from .gripper_geometry import PandaGripperGeometry
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,9 @@ class MujocoTaskExecutor:
         if attached_speed_scale <= 0.0:
             raise ValueError("携物阶段降速系数必须为正数")
         self.simulation = simulation
+        self.gripper_geometry = PandaGripperGeometry.from_model(simulation.model)
+        self._arm_dofs = [simulation.model.jnt_dofadr[simulation.model.joint(name).id]
+                          for name in self.arm_joint_names]
         self.attached_object: str | None = None
         self.events: list[SimulationEvent] = []
         self.frame_callback = frame_callback
@@ -133,6 +137,9 @@ class MujocoTaskExecutor:
 
     def _advance_one_step(self) -> None:
         """推进一个物理步；抓取物体仅由接触确认后启用的 MuJoCo 约束保持。"""
+        # 关节位置伺服需要机器人自身的偏置力前馈，避免静态重力使工作点下沉。
+        # 仅作用于七个手臂自由度，不向手指或工件施力，也不读取工件真值。
+        self.simulation.data.qfrc_applied[self._arm_dofs] = self.simulation.data.qfrc_bias[self._arm_dofs]
         mujoco.mj_step(self.simulation.model, self.simulation.data)
         self._step_count += 1
         self._pace_realtime()
@@ -143,12 +150,60 @@ class MujocoTaskExecutor:
         model, data = self.simulation.model, self.simulation.data
         return {
             name: float(data.qpos[model.jnt_qposadr[model.joint(name).id]])
-            for name in self.arm_joint_names
+            for name in (*self.arm_joint_names, "finger_joint1", "finger_joint2")
         }
 
     def body_position(self, body_name: str) -> np.ndarray:
         """返回当前仿真机体位置，仅用于执行遥测，绝不参与控制决策。"""
         return self.simulation.data.xpos[self.simulation.model.body(body_name).id].copy()
+
+    def validate_support_lift(
+        self, joint_names, positions, attached_position, attached_rotation,
+        shape_type: str, dimensions, table_top_m: float,
+    ) -> None:
+        """核验规划的离桌段：仅容许起始 1 mm 支承接触，随后确实向上离桌。
+
+        使用机器人 FK 与视觉附着模型，绝不读取工件的仿真位姿。
+        其它碰撞由 MoveIt 原样检查；此处补上临时许可的工件／桌面碰撞对。
+        """
+        model = self.simulation.model
+        scratch = mujoco.MjData(model)
+        scratch.qpos[:] = self.simulation.data.qpos
+        hand = model.body("hand").id
+        addresses = [model.jnt_qposadr[model.joint(name.replace("panda_", "")).id]
+                     for name in joint_names]
+        previous = scratch.qpos[addresses].copy()
+        samples = [previous]
+        for point in positions:
+            goal = np.asarray(point, dtype=float)
+            steps = max(1, int(np.ceil(np.max(np.abs(goal - previous)) / .002)))
+            samples.extend(previous + (goal - previous) * i / steps for i in range(1, steps + 1))
+            previous = goal
+        bottoms, centers = [], []
+        for sample in samples:
+            scratch.qpos[addresses] = sample
+            mujoco.mj_kinematics(model, scratch)
+            hand_rotation = scratch.xmat[hand].reshape(3, 3)
+            center = scratch.xpos[hand] + hand_rotation @ attached_position
+            rotation = hand_rotation @ attached_rotation
+            if shape_type == "box":
+                half_height = float(np.abs(rotation[2]) @ (np.asarray(dimensions) / 2))
+            elif shape_type == "cylinder":
+                axial = abs(float(rotation[2, 2]))
+                half_height = dimensions[0] / 2 * axial + dimensions[1] * np.sqrt(max(0., 1 - axial**2))
+            else:
+                raise ValueError("不支持的附着支承几何")
+            bottoms.append(float(center[2] - half_height))
+            centers.append(center)
+        minimum = min(bottoms)
+        if (minimum < table_top_m - .001 or minimum < bottoms[0] - .001
+                or bottoms[-1] < table_top_m + .005):
+            raise RuntimeError("离桌轨迹未通过工件／桌面净空验收")
+        for bottom, center in zip(bottoms, centers):
+            if bottom < table_top_m + .005 and np.linalg.norm(center[:2] - centers[0][:2]) > .005:
+                raise RuntimeError("离桌前出现过大的横向搬移，拒绝支承接触例外")
+        self._event("support_lift_validated", initial_bottom_m=bottoms[0], minimum_bottom_m=minimum,
+                    final_bottom_m=bottoms[-1], table_top_m=float(table_top_m), samples=float(len(samples)))
 
     def execute_joint_target(self, target: dict[str, float], duration_s: float) -> None:
         """以位置控制器回放一段 MoveIt 关节目标；执行器不生成关节轨迹。"""
@@ -160,7 +215,7 @@ class MujocoTaskExecutor:
             fraction = index / steps
             data.ctrl[:7] = start + fraction * (goal - start)
             self._advance_one_step()
-        actual = np.array(list(self.joint_positions().values()))
+        actual = np.array([self.joint_positions()[name] for name in self.arm_joint_names])
         tracking_error = float(np.max(np.abs(goal - actual)))
         self._event("trajectory_segment_complete", duration_s=float(duration_s), max_joint_error_rad=tracking_error)
         if tracking_error > 0.08:
@@ -243,6 +298,30 @@ class MujocoTaskExecutor:
                 print(f"[轨迹进度] {100 * (waypoint_index + 1) / len(waypoint_times_s):.0f}%；实际耗时={time.monotonic() - wall_start:.1f}s；最大跟踪误差={max_tracking_error:.4f}rad", flush=True)
                 next_progress_wall = time.monotonic() + 2.0
 
+        # 时间轨迹结束不等于工具已到位。继续真实伺服，而非重写关节位置，
+        # 以同一工作点验收终点，避免在厘米级跟踪滞后时开始闭爪或构造附着位姿。
+        ideal = mujoco.MjData(model)
+        ideal.qpos[:] = data.qpos
+        for name, value in zip(self.arm_joint_names, previous_positions):
+            ideal.qpos[model.jnt_qposadr[model.joint(name).id]] = value
+        mujoco.mj_kinematics(model, ideal)
+        hand = model.body("hand").id
+        ideal_rotation = ideal.xmat[hand].reshape(3, 3)
+        ideal_tcp = ideal.xpos[hand] + ideal_rotation @ self.gripper_geometry.tcp_hand_m
+        settle_steps = int(np.ceil(2.0 / model.opt.timestep))
+        for settle_step in range(settle_steps + 1):
+            rotation = data.xmat[hand].reshape(3, 3)
+            actual_tcp = data.xpos[hand] + rotation @ self.gripper_geometry.tcp_hand_m
+            tcp_error = float(np.linalg.norm(actual_tcp - ideal_tcp))
+            angle_error = float(np.arccos(np.clip((np.trace(ideal_rotation.T @ rotation) - 1) / 2, -1, 1)))
+            if tcp_error <= 0.003 and angle_error <= 0.02:
+                break
+            if settle_step < settle_steps:
+                self._advance_one_step()
+        self._event("trajectory_workpoint_checked", position_error_m=tcp_error,
+                    orientation_error_rad=angle_error, settle_s=settle_step * model.opt.timestep)
+        if tcp_error > 0.003 or angle_error > 0.02:
+            raise RuntimeError(f"工具工作点未到位：位置误差={tcp_error * 1000:.2f}mm，姿态误差={angle_error:.4f}rad")
         final_positions = np.array([self.joint_positions()[name] for name in self.arm_joint_names])
         final_tracking_error = float(np.max(np.abs(previous_positions - final_positions)))
         print(f"[轨迹完成] 实际耗时={time.monotonic() - wall_start:.2f}s；仿真时长={commanded_duration_s:.2f}s；最大跟踪误差={max_tracking_error:.4f}rad", flush=True)
@@ -278,6 +357,20 @@ class MujocoTaskExecutor:
         for _ in range(steps):
             self._advance_one_step()
         self._event("gripper_open" if opened else "gripper_close")
+
+    def set_gripper_width(self, width_m: float, settle_s: float = 0.80, *, require_reached: bool = True) -> None:
+        """按标注的预张开净空控制两指，闭合仍由真实双侧接触确认。"""
+        position = self.gripper_geometry.finger_position_for_width(width_m)
+        self.simulation.data.ctrl[7] = 255.0 * position / self.gripper_geometry.finger_travel_m
+        for _ in range(max(1, int(np.ceil(settle_s / self.simulation.model.opt.timestep)))):
+            self._advance_one_step()
+        actual = self.joint_positions()
+        self._event("gripper_preshape", required_width_m=float(width_m),
+                    target_finger_position_m=position,
+                    left_finger_position_m=actual["finger_joint1"],
+                    right_finger_position_m=actual["finger_joint2"])
+        if require_reached and max(abs(actual[n] - position) for n in ("finger_joint1", "finger_joint2")) > 0.001:
+            raise RuntimeError("夹爪预张开未到达标注开度，拒绝按未实现的开度继续规划")
 
     def close_until_dual_contact(
         self,

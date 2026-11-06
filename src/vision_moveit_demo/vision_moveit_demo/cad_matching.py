@@ -2105,10 +2105,11 @@ class CadMatcherDispatcher:
 
 
 def grasp_pose_from_template(pose: CadPoseEstimate, template: GraspTemplate) -> tuple[np.ndarray, np.ndarray]:
-    """将对象标注抓取框变换为 MoveIt ``panda_hand`` 目标。
+    """返回标注工作点位置与 MoveIt ``panda_link8`` 朝向。
 
-    CAD 标注使用 MuJoCo 指尖的夹合坐标系。实际 ``hand`` 的闭合轴相对 MoveIt
-    ``panda_hand`` 目标反向偏 45°，故目标须施加正向 45° 补偿。该符号已通过
+    CAD 标注使用两侧主接触垫中点的夹合坐标系。实际 ``hand`` 相对 link8
+    安装旋转 -45°，故请求朝向须施加正向 45° 补偿。位置尚未扣除工具偏移。
+    该符号已通过
     真实 MuJoCo 双指接触的轴对齐检查验证。
     """
     rotation = pose.transform_base_object[:3, :3]

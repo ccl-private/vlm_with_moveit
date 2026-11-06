@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import time
@@ -10,12 +11,13 @@ from pathlib import Path
 import numpy as np
 import rclpy
 from geometry_msgs.msg import Pose, PoseStamped
-from moveit_msgs.msg import AttachedCollisionObject, CollisionObject, PlanningScene, PlanningSceneComponents, RobotTrajectory
-from moveit_msgs.srv import GetPositionIK, GetPlanningScene
+from moveit_msgs.msg import AllowedCollisionEntry, AttachedCollisionObject, CollisionObject, MotionPlanRequest, PlanningScene, PlanningSceneComponents, RobotState, RobotTrajectory
+from moveit_msgs.srv import ApplyPlanningScene, GetPositionIK, GetPlanningScene, GetStateValidity
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import String
+from rosidl_runtime_py.convert import message_to_ordereddict
 
 from .stage2_executor import MujocoTaskExecutor
 from .unified_scene import UnifiedPandaCupSimulation
@@ -30,25 +32,98 @@ class MoveItTrajectoryClient(Node):
         self.joint_publisher = self.create_publisher(JointState, "/vision_moveit/sim_joint_states", 10)
         self.trajectories: list[RobotTrajectory] = []
         self.planning_statuses: list[str] = []
+        self.planning_trace: list[dict] = []
+        self.planned_start_states: list[RobotState] = []
         self.ik_client = self.create_client(GetPositionIK, "/compute_ik")
         self.latest_joint_message: JointState | None = None
         self._published_world_object_ids: set[str] = set()
         self._published_attached_object_ids: set[str] = set()
+        self._base_acm = None
+        self._support_pair = None
+        self.attached_collision_object = None
         self.create_subscription(RobotTrajectory, "/vision_moveit/planned_trajectory", self.trajectories.append, 10)
         self.create_subscription(String, "/vision_moveit/planning_status", lambda message: self.planning_statuses.append(message.data), 10)
+        self.create_subscription(MotionPlanRequest, "/vision_moveit/planning_request",
+                                 lambda message: self._trace("planning_request", message), 10)
+        self.create_subscription(RobotState, "/vision_moveit/planned_start_state",
+                                 self._record_planned_start, 10)
         scene_client = self.create_client(GetPlanningScene, "/get_planning_scene")
         if scene_client.wait_for_service(timeout_sec=2.0):
             query = GetPlanningScene.Request()
-            query.components.components = PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+            query.components.components = (PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+                                           | PlanningSceneComponents.ALLOWED_COLLISION_MATRIX)
             future = scene_client.call_async(query)
             rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
             if future.done() and future.result() is not None:
+                self._base_acm = copy.deepcopy(future.result().scene.allowed_collision_matrix)
                 self._published_attached_object_ids = {
                     item.object.id for item in future.result().scene.robot_state.attached_collision_objects
                     if item.object.id.startswith("stage2_")
                 }
                 if self._published_attached_object_ids:
                     print(f"[场景同步] 下一次发布将清理前一回合的附着碰撞体：{sorted(self._published_attached_object_ids)}", flush=True)
+
+    def restore_support_contact(self):
+        if self._support_pair is None:
+            return
+        query = ApplyPlanningScene.Request()
+        query.scene.is_diff = True
+        query.scene.robot_state.is_diff = True
+        query.scene.allowed_collision_matrix = copy.deepcopy(self._base_acm)
+        service = self.create_client(ApplyPlanningScene, "/apply_planning_scene")
+        try:
+            if not service.wait_for_service(timeout_sec=2):
+                raise RuntimeError("无法恢复离桌阶段的碰撞检查")
+            future = service.call_async(query)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=2)
+            if not future.done() or future.result() is None or not future.result().success:
+                raise RuntimeError("恢复离桌阶段的碰撞检查失败")
+            self._trace("restored_support_collision", query.scene)
+            self._support_pair = None
+        finally:
+            self.destroy_client(service)
+
+    def _trace(self, kind, message):
+        self.planning_trace.append(dict(kind=kind, message=message_to_ordereddict(message)))
+
+    def _record_planned_start(self, message):
+        self.planned_start_states.append(message)
+        self._trace("planned_start_state", message)
+
+    def _matching_planning_result(self, target):
+        trajectory = next((t for t in reversed(self.trajectories)
+                           if t.joint_trajectory.header.stamp == target.header.stamp), None)
+        start = next((s for s in reversed(self.planned_start_states)
+                      if s.joint_state.header.stamp == target.header.stamp), None)
+        if trajectory is None or start is None:
+            return None
+        attached_ids = {a.object.id for a in start.attached_collision_objects}
+        if not self._published_attached_object_ids <= attached_ids:
+            raise RuntimeError("完整规划起点丢失手持物体，拒绝执行返回轨迹")
+        return trajectory
+
+    def _read_collision_matrix(self):
+        """ROS 发现或冷启动时查询可能晚到；不把一次超时当成空碰撞规则。"""
+        service = self.create_client(GetPlanningScene, "/get_planning_scene")
+        deadline = time.monotonic() + 6
+        try:
+            while time.monotonic() < deadline:
+                if not service.wait_for_service(timeout_sec=.5):
+                    continue
+                query = GetPlanningScene.Request()
+                query.components.components = PlanningSceneComponents.ALLOWED_COLLISION_MATRIX
+                future = service.call_async(query)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=1)
+                if future.done() and future.result() is not None:
+                    matrix = future.result().scene.allowed_collision_matrix
+                    if matrix.entry_names:
+                        self._trace("initial_collision_matrix", matrix)
+                        return copy.deepcopy(matrix)
+                else:
+                    future.cancel()
+            raise RuntimeError("多次查询仍未取得碰撞许可矩阵，拒绝启用离桌接触策略")
+        finally:
+            self.destroy_client(service)
 
     def publish_joint_state(self, positions: dict[str, float]) -> None:
         message = JointState()
@@ -74,6 +149,13 @@ class MoveItTrajectoryClient(Node):
             float(np.clip(positions[f"joint{index}"], lower + epsilon, upper - epsilon))
             for index, (lower, upper) in enumerate(joint_limits, start=1)
         ]
+        # 手指必须来自实际执行遥测，缺少时拒绝猜测闭合状态。
+        for index in (1, 2):
+            message.name.append(f"panda_finger_joint{index}")
+            value = float(positions[f"finger_joint{index}"])
+            if not np.isfinite(value) or not -0.001 <= value <= 0.041:
+                raise ValueError("实际手指关节状态超出模型范围")
+            message.position.append(float(np.clip(value, 0.0, 0.04)))
         self.joint_publisher.publish(message)
         self.latest_joint_message = message
 
@@ -89,6 +171,7 @@ class MoveItTrajectoryClient(Node):
         temporary_exclusions: tuple[str, ...] = (),
         attached_object: str | None = None,
         attached_pose: Pose | None = None,
+        allow_support_contact: bool = False,
     ) -> None:
         """发布显式场景坐标；视觉闭环调用方不得传入 MuJoCo 真值快照。"""
         scene = PlanningScene(is_diff=True)
@@ -171,7 +254,27 @@ class MoveItTrajectoryClient(Node):
             attached_message.touch_links = ["panda_hand", "panda_leftfinger", "panda_rightfinger"]
             attached_message.object = attached
             scene.robot_state.attached_collision_objects.append(attached_message)
+            self.attached_collision_object = attached_message
+        if allow_support_contact or self._support_pair is not None:
+            if self._base_acm is None or not self._base_acm.entry_names:
+                self._base_acm = self._read_collision_matrix()
+            matrix = copy.deepcopy(self._base_acm)
+            pair = (desired_attached_id, "stage2_table") if allow_support_contact else self._support_pair
+            for name in pair:
+                if name is None:
+                    raise ValueError("离桌接触策略需要手持物体")
+                if name not in matrix.entry_names:
+                    matrix.entry_names.append(name)
+                    for row in matrix.entry_values:
+                        row.enabled.append(False)
+                    matrix.entry_values.append(AllowedCollisionEntry(enabled=[False] * len(matrix.entry_names)))
+            first, second = (matrix.entry_names.index(name) for name in pair)
+            matrix.entry_values[first].enabled[second] = allow_support_contact
+            matrix.entry_values[second].enabled[first] = allow_support_contact
+            scene.allowed_collision_matrix = matrix
+            self._support_pair = pair if allow_support_contact else None
         self.scene_publisher.publish(scene)
+        self._trace("published_scene", scene)
         self._published_world_object_ids = desired_world_ids
         self._published_attached_object_ids = (
             {desired_attached_id} if desired_attached_id is not None else set()
@@ -192,7 +295,46 @@ class MoveItTrajectoryClient(Node):
             temporary_exclusions=tuple(sorted(policy.world_exclusions())),
             attached_object=policy.attached_object(),
             attached_pose=attached_pose,
+            allow_support_contact=phase == PlanningPhase.LIFT,
         )
+
+    def check_attached_start(self, target_object: str) -> None:
+        """离桌前核对当前场景及碰撞，只接受目标与支承桌面不超过 1 mm 的接触。"""
+        scene_client = self.create_client(GetPlanningScene, "/get_planning_scene")
+        validity_client = self.create_client(GetStateValidity, "/check_state_validity")
+        try:
+            if not scene_client.wait_for_service(timeout_sec=2) or not validity_client.wait_for_service(timeout_sec=2):
+                raise RuntimeError("无法核对附着起点")
+            deadline = time.monotonic() + 3
+            while True:
+                query = GetPlanningScene.Request()
+                query.components.components = PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+                future = scene_client.call_async(query)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=2)
+                if not future.done() or future.result() is None:
+                    raise RuntimeError("附着场景查询未返回")
+                scene = future.result().scene
+                if f"stage2_{target_object}" in {a.object.id for a in scene.robot_state.attached_collision_objects}:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("手持物体尚未进入规划场景")
+            query = GetStateValidity.Request()
+            query.group_name = "panda_arm"
+            query.robot_state.is_diff = True
+            query.robot_state.joint_state = self.latest_joint_message
+            future = validity_client.call_async(query)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=2)
+            if not future.done() or future.result() is None:
+                raise RuntimeError("附着起点碰撞查询未返回")
+            result = future.result()
+            self._trace("attached_start_validity", result)
+            if not result.valid and (not result.contacts or any(
+                {c.contact_body_1, c.contact_body_2} != {f"stage2_{target_object}", "stage2_table"}
+                or c.depth > .001 for c in result.contacts)):
+                raise RuntimeError("携物起点存在支承接触以外的碰撞，拒绝抬升")
+        finally:
+            self.destroy_client(scene_client)
+            self.destroy_client(validity_client)
 
     def request(
         self,
@@ -208,6 +350,7 @@ class MoveItTrajectoryClient(Node):
         # 未指定时保持历史基线的向下夹爪；CAD 抓取标注可传入完整 6D 姿态。
         orientation = np.array([1.0, 0.0, 0.0, 0.0]) if orientation_xyzw is None else orientation_xyzw
         target.pose.orientation.x, target.pose.orientation.y, target.pose.orientation.z, target.pose.orientation.w = map(float, orientation)
+        self._trace("target", target)
         print(
             "[MoveIt 请求] "
             f"位置=({position[0]:.4f}, {position[1]:.4f}, {position[2]:.4f})，"
@@ -215,9 +358,10 @@ class MoveItTrajectoryClient(Node):
             f"模式={'仅位置' if position_only else '完整姿态'}，超时={timeout_s:.1f}s",
             flush=True,
         )
-        # 串行任务在发送前清空已处理轨迹；部分 ROS 发行版会重写 trajectory header
-        # 的时间戳，故不能把它作为唯一关联键。
+        # 本项目桥接器在 MoveIt 返回之后给轨迹和起点加上相同的请求戳。
+        # 必须收齐对应的两份消息，防止执行迟到轨迹或遗漏最终一段的附着证据。
         self.trajectories.clear()
+        self.planned_start_states.clear()
         self.planning_statuses.clear()
         if not position_only and self.latest_joint_message is not None and self.ik_client.service_is_ready():
             check = GetPositionIK.Request()
@@ -231,14 +375,16 @@ class MoveItTrajectoryClient(Node):
             future = self.ik_client.call_async(check)
             rclpy.spin_until_future_complete(self, future, timeout_sec=1.0)
             if future.done() and future.result() is not None and future.result().error_code.val != 1:
+                self._trace("rejected_ik_request", check)
                 print(f"[MoveIt 快速预检] 目标无有效 IK/碰撞解，错误码={future.result().error_code.val}，跳过长时间规划", flush=True)
                 raise TimeoutError("目标未通过快速 IK/碰撞预检")
         self.trajectory_publisher.publish(target)
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
-            if self.trajectories:
-                return self.trajectories[-1]
+            result = self._matching_planning_result(target)
+            if result is not None:
+                return result
             if any("规划失败" in status for status in self.planning_statuses):
                 raise TimeoutError("MoveIt 已明确拒绝该目标位姿，请检查 IK/碰撞约束")
         raise TimeoutError(

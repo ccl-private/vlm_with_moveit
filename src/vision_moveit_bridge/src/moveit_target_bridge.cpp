@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -9,6 +10,8 @@
 #include <moveit/planning_scene_interface/planning_scene_interface.hpp>
 #include <moveit_msgs/msg/planning_scene.hpp>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <moveit_msgs/msg/motion_plan_request.hpp>
+#include <moveit_msgs/msg/robot_state.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -21,6 +24,10 @@ class MoveItTargetBridge : public rclcpp::Node {
     trajectory_publisher_ = create_publisher<moveit_msgs::msg::RobotTrajectory>(
         "/vision_moveit/planned_trajectory", 10);
     status_publisher_ = create_publisher<std_msgs::msg::String>("/vision_moveit/planning_status", 10);
+    request_publisher_ = create_publisher<moveit_msgs::msg::MotionPlanRequest>(
+        "/vision_moveit/planning_request", 10);
+    start_state_publisher_ = create_publisher<moveit_msgs::msg::RobotState>(
+        "/vision_moveit/planned_start_state", 10);
     subscription_ = create_subscription<geometry_msgs::msg::PoseStamped>(
         "/vision_moveit/target_pose", 10,
         std::bind(&MoveItTargetBridge::plan_target, this, std::placeholders::_1));
@@ -77,6 +84,9 @@ class MoveItTargetBridge : public rclcpp::Node {
       move_group_->setPoseTarget(target.pose);
     }
     moveit::planning_interface::MoveGroupInterface::Plan plan;
+    moveit_msgs::msg::MotionPlanRequest request;
+    move_group_->constructMotionPlanRequest(request);
+    request_publisher_->publish(request);
     const auto result = move_group_->plan(plan);
     move_group_->clearPoseTargets();
     move_group_->setStartStateToCurrentState();
@@ -86,6 +96,10 @@ class MoveItTargetBridge : public rclcpp::Node {
     }
     // 透传请求时间戳，客户端据此拒绝后台规划线程迟到发布的旧轨迹。
     plan.trajectory.joint_trajectory.header.stamp = target.header.stamp;
+    // 用同一请求时间戳关联起点与轨迹，客户端必须收齐两者再执行。
+    auto recorded_start = plan.start_state;
+    recorded_start.joint_state.header.stamp = target.header.stamp;
+    start_state_publisher_->publish(recorded_start);
     trajectory_publisher_->publish(plan.trajectory);
     if (!execute_in_simulation_) {
       publish_status("MoveIt 规划成功，已发布关节轨迹（未执行）");
@@ -109,24 +123,21 @@ class MoveItTargetBridge : public rclcpp::Node {
   }
 
   void save_sim_joint_state(const sensor_msgs::msg::JointState::SharedPtr joint_state) {
+    std::lock_guard<std::mutex> lock(joint_state_mutex_);
     latest_sim_joint_state_ = *joint_state;
   }
 
   void set_start_state_from_simulation() {
+    std::lock_guard<std::mutex> lock(joint_state_mutex_);
     if (!latest_sim_joint_state_) {
       publish_status("未收到 MuJoCo 关节状态，使用 MoveIt 当前状态规划");
       return;
     }
-    moveit::core::RobotState start_state(move_group_->getRobotModel());
-    start_state.setToDefaultValues();
-    const auto& message = *latest_sim_joint_state_;
-    for (size_t index = 0; index < message.name.size() && index < message.position.size(); ++index) {
-      const auto& variable_names = start_state.getRobotModel()->getVariableNames();
-      if (std::find(variable_names.begin(), variable_names.end(), message.name[index]) != variable_names.end()) {
-        start_state.setVariablePosition(message.name[index], message.position[index]);
-      }
-    }
-    start_state.update();
+    // 只覆盖本次遥测关节，在 move_group 场景状态上合成起点。
+    // 完整默认 RobotState + 空附着列表会清掉已经附着到手上的碰撞体。
+    moveit_msgs::msg::RobotState start_state;
+    start_state.is_diff = true;
+    start_state.joint_state = *latest_sim_joint_state_;
     move_group_->setStartState(start_state);
   }
 
@@ -136,8 +147,11 @@ class MoveItTargetBridge : public rclcpp::Node {
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_subscription_;
   rclcpp::Publisher<moveit_msgs::msg::RobotTrajectory>::SharedPtr trajectory_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
+  rclcpp::Publisher<moveit_msgs::msg::MotionPlanRequest>::SharedPtr request_publisher_;
+  rclcpp::Publisher<moveit_msgs::msg::RobotState>::SharedPtr start_state_publisher_;
   moveit::planning_interface::PlanningSceneInterface planning_scene_interface_;
   std::optional<sensor_msgs::msg::JointState> latest_sim_joint_state_;
+  std::mutex joint_state_mutex_;
   bool execute_in_simulation_{false};
 };
 

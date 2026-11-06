@@ -10,6 +10,7 @@ class PlanningPhase(StrEnum):
 
     PREGRASP = "pregrasp"
     APPROACH = "approach"
+    LIFT = "lift"
     TRANSPORT = "transport"
     PLACE = "place"
 
@@ -35,6 +36,7 @@ class TaskPlanningScenePolicy:
         exclusions = set(self.compatibility_exclusions)
         if self.phase in {
             PlanningPhase.APPROACH,
+            PlanningPhase.LIFT,
             PlanningPhase.TRANSPORT,
             PlanningPhase.PLACE,
         }:
@@ -46,6 +48,6 @@ class TaskPlanningScenePolicy:
         return frozenset(exclusions)
 
     def attached_object(self) -> str | None:
-        if self.phase in {PlanningPhase.TRANSPORT, PlanningPhase.PLACE}:
+        if self.phase in {PlanningPhase.LIFT, PlanningPhase.TRANSPORT, PlanningPhase.PLACE}:
             return self.target_object
         return None
